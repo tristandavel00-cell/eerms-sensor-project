@@ -1,0 +1,10 @@
+cmake_minimum_required(VERSION 3.20.0)
+
+find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
+project(gpio_interrupt_clean)
+
+target_sources(app PRIVATE
+	src/main.c
+	src/app_ble.c
+	src/app_nfc.c
+)
