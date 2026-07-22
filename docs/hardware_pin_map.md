@@ -67,3 +67,21 @@ H4 is a six-pin Tag-Connect SWD connector.
 | 4 | SWDCLK | Serial Wire Debug clock |
 | 5 | GND | Ground |
 | 6 | RESET | Target reset |
+
+## SWD bring-up result
+
+The production PCB was successfully detected through the nRF52-DK P20 external debug interface using the TC2030-CTX cable and a custom remapping adapter.
+
+J-Link connection settings:
+
+- Device: NRF52832_XXAA
+- Interface: SWD
+- Speed: 100 kHz
+
+Successful detection included:
+
+- SW-DP ID: 0x2BA01477
+- Cortex-M4 r0p1 detected
+- Target core identified successfully
+
+This confirms that target power reference, common ground, SWDIO, SWDCLK, cable orientation, and external-target selection are functioning.
