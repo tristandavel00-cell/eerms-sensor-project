@@ -16,12 +16,13 @@
 
 LOG_MODULE_REGISTER(app_ble, LOG_LEVEL_DBG);
 
-#define APP_STATUS_PACKET_SIZE	      12
-#define APP_STATUS_MODE_OFFSET	      0
-#define APP_STATUS_BUTTON_OFFSET      1
-#define APP_STATUS_CLICK_COUNT_OFFSET 4
-#define APP_STATUS_UPTIME_OFFSET      8
-#define VIBRATION_PACKET_SIZE 12
+#define APP_STATUS_PACKET_SIZE        12U
+#define APP_STATUS_MODE_OFFSET         0U
+#define APP_STATUS_BUTTON_OFFSET       1U
+#define APP_STATUS_CLICK_COUNT_OFFSET  4U
+#define APP_STATUS_UPTIME_OFFSET       8U
+#define ACCEL_PACKET_SIZE              6U
+#define VIBRATION_PACKET_SIZE         12U
 
 #define BT_UUID_BUTTON_SERVICE_VAL \
 	BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x56789abcdef0)
@@ -40,14 +41,15 @@ LOG_MODULE_REGISTER(app_ble, LOG_LEVEL_DBG);
 
 static const struct app_ble_callbacks *app_callbacks;
 static struct bt_conn *current_conn;
+
 static bool single_click_notifications_enabled;
 static bool app_mode_notifications_enabled;
 static bool accel_notifications_enabled;
+static bool vibration_notifications_enabled;
+
 static int16_t latest_accel_x_mg;
 static int16_t latest_accel_y_mg;
 static int16_t latest_accel_z_mg;
-static bool vibration_notifications_enabled;
-
 static int16_t latest_mean_x_mg;
 static int16_t latest_mean_y_mg;
 static int16_t latest_mean_z_mg;
@@ -66,7 +68,7 @@ static struct bt_uuid_128 app_status_uuid =
 	BT_UUID_INIT_128(BT_UUID_APP_STATUS_VAL);
 static struct bt_uuid_128 app_command_uuid =
 	BT_UUID_INIT_128(BT_UUID_APP_COMMAND_VAL);
-static struct bt_uuid_128 accel_data_uuid = 
+static struct bt_uuid_128 accel_data_uuid =
 	BT_UUID_INIT_128(BT_UUID_ACCEL_DATA_VAL);
 static struct bt_uuid_128 vibration_data_uuid =
 	BT_UUID_INIT_128(BT_UUID_VIBRATION_DATA_VAL);
@@ -149,17 +151,18 @@ static void app_mode_ccc_changed(const struct bt_gatt_attr *attr,
 }
 
 static void accel_ccc_changed(const struct bt_gatt_attr *attr,
-				uint16_t value)
+			      uint16_t value)
 {
 	ARG_UNUSED(attr);
 
-	accel_notifications_enabled = 
+	accel_notifications_enabled =
 		(value == BT_GATT_CCC_NOTIFY);
 
 	LOG_INF("Accelerometer notifications %s",
-		accel_notifications_enabled ? 
+		accel_notifications_enabled ?
 			"enabled" : "disabled");
 }
+
 static void vibration_ccc_changed(const struct bt_gatt_attr *attr,
 				  uint16_t value)
 {
@@ -213,6 +216,13 @@ BT_GATT_SERVICE_DEFINE(
 	BT_GATT_CCC(vibration_ccc_changed,
 		    BT_GATT_PERM_READ | BT_GATT_PERM_WRITE)
 );
+
+static void accel_packet_build(uint8_t *packet)
+{
+	sys_put_le16((uint16_t)latest_accel_x_mg, &packet[0]);
+	sys_put_le16((uint16_t)latest_accel_y_mg, &packet[2]);
+	sys_put_le16((uint16_t)latest_accel_z_mg, &packet[4]);
+}
 
 static void vibration_packet_build(uint8_t *packet)
 {
@@ -375,9 +385,12 @@ static ssize_t read_single_click_count(struct bt_conn *conn,
 				       uint16_t len,
 				       uint16_t offset)
 {
-	uint32_t value = app_callbacks->click_count_get();
+	uint8_t packet[sizeof(uint32_t)];
+
+	sys_put_le32(app_callbacks->click_count_get(), packet);
+
 	return bt_gatt_attr_read(conn, attr, buf, len, offset,
-				 &value, sizeof(value));
+				 packet, sizeof(packet));
 }
 
 static ssize_t write_app_mode(struct bt_conn *conn,
@@ -442,27 +455,17 @@ static ssize_t read_app_status(struct bt_conn *conn,
 }
 
 static ssize_t read_accel_data(struct bt_conn *conn,
-					const struct bt_gatt_attr *attr,
-					void *buf,
-					uint16_t len,
-					uint16_t offset)
+			       const struct bt_gatt_attr *attr,
+			       void *buf,
+			       uint16_t len,
+			       uint16_t offset)
 {
-	uint8_t packet[6];
+	uint8_t packet[ACCEL_PACKET_SIZE];
 
-	sys_put_le16((uint16_t)latest_accel_x_mg,
-				&packet[0]);
-	sys_put_le16((uint16_t)latest_accel_y_mg,
-				&packet[2]);
-	sys_put_le16((uint16_t)latest_accel_z_mg,
-				&packet[4]);
+	accel_packet_build(packet);
 
-	return bt_gatt_attr_read(conn,
-				attr,
-				buf,
-				len,
-				offset,
-				packet,
-				sizeof(packet));
+	return bt_gatt_attr_read(conn, attr, buf, len, offset,
+				 packet, sizeof(packet));
 }
 
 static ssize_t read_vibration_data(struct bt_conn *conn,
@@ -524,8 +527,7 @@ int app_ble_start(const struct app_ble_callbacks *callbacks)
 	    (callbacks->click_count_get == NULL) ||
 	    (callbacks->mode_get == NULL) ||
 	    (callbacks->button_pressed_get == NULL) ||
-	    (callbacks->uptime_seconds_get == NULL) || 
-		(callbacks->accel_window_count_get == NULL)) {
+	    (callbacks->uptime_seconds_get == NULL)) {
 		return -EINVAL;
 	}
 
@@ -557,17 +559,26 @@ int app_ble_start(const struct app_ble_callbacks *callbacks)
 
 int app_ble_notify_click_count(uint32_t click_count)
 {
+	uint8_t packet[sizeof(uint32_t)];
+	int err;
+
 	if (current_conn == NULL) {
 		LOG_DBG("Click notification skipped: no active connection");
 		return -ENOTCONN;
 	}
+
 	if (!single_click_notifications_enabled) {
 		LOG_DBG("Click notification skipped: notifications disabled");
 		return -EACCES;
 	}
 
-	int err = bt_gatt_notify(current_conn, &button_service.attrs[2],
-				 &click_count, sizeof(click_count));
+	sys_put_le32(click_count, packet);
+
+	err = bt_gatt_notify_uuid(current_conn,
+				  &single_click_count_uuid.uuid,
+				  button_service.attrs,
+				  packet,
+				  sizeof(packet));
 	if (err < 0) {
 		LOG_ERR("Failed to send click notification: %d", err);
 		return err;
@@ -579,21 +590,30 @@ int app_ble_notify_click_count(uint32_t click_count)
 
 int app_ble_notify_mode(enum app_mode mode)
 {
+	uint8_t value;
+	int err;
+
 	if (mode > APP_MODE_DIAGNOSTIC) {
 		return -EINVAL;
 	}
+
 	if (current_conn == NULL) {
 		LOG_DBG("Mode notification skipped: no active connection");
 		return -ENOTCONN;
 	}
+
 	if (!app_mode_notifications_enabled) {
 		LOG_DBG("Mode notification skipped: notifications disabled");
 		return -EACCES;
 	}
 
-	uint8_t value = (uint8_t)mode;
-	int err = bt_gatt_notify(current_conn, &button_service.attrs[5],
-				 &value, sizeof(value));
+	value = (uint8_t)mode;
+
+	err = bt_gatt_notify_uuid(current_conn,
+				  &app_mode_uuid.uuid,
+				  button_service.attrs,
+				  &value,
+				  sizeof(value));
 	if (err < 0) {
 		LOG_ERR("Failed to send mode notification: %d", err);
 		return err;
@@ -609,43 +629,41 @@ bool app_ble_is_connected(void)
 }
 
 int app_ble_update_accel(int16_t x_mg,
-					int16_t y_mg,
-					int16_t z_mg)
+			 int16_t y_mg,
+			 int16_t z_mg)
 {
-	uint8_t packet[6];
-	latest_accel_x_mg = x_mg;
-	latest_accel_x_mg = y_mg;
-	latest_accel_x_mg = z_mg;
+	uint8_t packet[ACCEL_PACKET_SIZE];
+	int err;
 
-	if(current_conn == NULL) {
-		LOG_DBG("Accelerometer notification skipped: "
-			"no active connection");
+	latest_accel_x_mg = x_mg;
+	latest_accel_y_mg = y_mg;
+	latest_accel_z_mg = z_mg;
+
+	if (current_conn == NULL) {
+		LOG_DBG("Accelerometer notification skipped: no active connection");
+		return -ENOTCONN;
+	}
+
+	if (!accel_notifications_enabled) {
+		LOG_DBG("Accelerometer notification skipped: notifications disabled");
 		return -EACCES;
 	}
 
-	sys_put_le16((uint16_t)x_mg, &packet[0]);
-	sys_put_le16((uint16_t)y_mg, &packet[2]);
-	sys_put_le16((uint16_t)z_mg, &packet[4]);
+	accel_packet_build(packet);
 
-	int err = bt_gatt_notify(current_conn,
-				&button_service.attrs[12],
-				packet,
-				sizeof(packet));
-
+	err = bt_gatt_notify_uuid(current_conn,
+				  &accel_data_uuid.uuid,
+				  button_service.attrs,
+				  packet,
+				  sizeof(packet));
 	if (err < 0) {
-		LOG_ERR("Failed to send accelerometer notification: %d",
-			err);
+		LOG_ERR("Failed to send accelerometer notification: %d", err);
 		return err;
 	}
 
-	LOG_DBG("Accelerometer notification sent: "
-		"X=%d, Y=%d, Z=%d",
-		x_mg,
-		y_mg,
-		z_mg);
-
+	LOG_DBG("Accelerometer notification sent: X=%d, Y=%d, Z=%d mg",
+		x_mg, y_mg, z_mg);
 	return 0;
-
 }
 
 int app_ble_update_vibration(int16_t mean_x_mg,

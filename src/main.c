@@ -7,10 +7,8 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/settings/settings.h>
-#include <zephyr/sys/printk.h>
 #include <zephyr/sys/util.h>
 #include <nfc_t4t_lib.h>
-
 
 #include "app_ble.h"
 #include "app_nfc.h"
@@ -37,30 +35,30 @@ LOG_MODULE_REGISTER(button_app, LOG_LEVEL_DBG);
 #endif
 
 /* Timing configuration */
-#define DEBOUNCE_TIME_MS	    30
-#define HEARTBEAT_INTERVAL_MS	    1000
-#define HEARTBEAT_LOG_INTERVAL	    10
-#define LONG_PRESS_TIME_MS	    2000
-#define DOUBLE_CLICK_TIME_MS	    400
-#define DOUBLE_CLICK_BLINK_DELAY_MS 100
-#define DOUBLE_CLICK_BLINK_COUNT    2
-#define HEARTBEAT_ENABLED	    0
-#define ACCEL_SAMPLE_INTERVAL_MS 10
-#define ACCEL_BLE_REPORT_INTERVAL_MS 500
-#define ACCEL_WAKE_THRESHOLD_MG 250U
+#define DEBOUNCE_TIME_MS               30
+#define HEARTBEAT_INTERVAL_MS          1000
+#define HEARTBEAT_LOG_INTERVAL         10
+#define LONG_PRESS_TIME_MS             2000
+#define DOUBLE_CLICK_TIME_MS           400
+#define DOUBLE_CLICK_BLINK_DELAY_MS    100
+#define DOUBLE_CLICK_BLINK_COUNT       2
+#define HEARTBEAT_ENABLED              0
+#define ACCEL_SAMPLE_INTERVAL_MS       10
+#define ACCEL_BLE_REPORT_INTERVAL_MS   500
+#define ACCEL_WAKE_THRESHOLD_MG        250U
+#define ACCEL_SETTLING_SAMPLE_COUNT    4U
+#define ACCEL_WINDOW_SAMPLE_COUNT      100
+#define ACCEL_BLE_REPORT_SAMPLE_COUNT \
+	(ACCEL_BLE_REPORT_INTERVAL_MS / ACCEL_SAMPLE_INTERVAL_MS)
 
 /* Event queue configuration */
 #define APP_EVENT_QUEUE_SIZE   32
 #define APP_EVENT_QUEUE_ALIGN  4
 #define APP_EVENT_VALUE_UNUSED 0
 
-#define ACCEL_WINDOW_SAMPLE_COUNT 100
-
+/* Persistent settings */
 #define APP_SETTINGS_SUBTREE "app"
 #define APP_SETTINGS_MODE_KEY "mode"
-
-#define ACCEL_BLE_REPORT_SAMPLE_COUNT \
-	(ACCEL_BLE_REPORT_INTERVAL_MS / ACCEL_SAMPLE_INTERVAL_MS)
 
 enum app_event_type {
 	APP_EVENT_BUTTON_PRESSED,
@@ -75,16 +73,11 @@ enum app_event_type {
 	APP_EVENT_STATUS_REPORT,
 	APP_EVENT_RESET_COUNTERS,
 	APP_EVENT_SET_MODE,
-
 	APP_EVENT_NFC_FIELD_ON,
 	APP_EVENT_NFC_FIELD_OFF,
 	APP_EVENT_NFC_DATA_READ,
 	APP_EVENT_NFC_DATA_UPDATED,
-
-	
 };
-
-
 
 struct app_event {
 	enum app_event_type type;
@@ -95,7 +88,6 @@ struct accel_window {
 	int16_t x_mg[ACCEL_WINDOW_SAMPLE_COUNT];
 	int16_t y_mg[ACCEL_WINDOW_SAMPLE_COUNT];
 	int16_t z_mg[ACCEL_WINDOW_SAMPLE_COUNT];
-
 	uint16_t sample_index;
 	uint32_t completed_window_count;
 };
@@ -104,7 +96,6 @@ struct vibration_result {
 	int16_t mean_x_mg;
 	int16_t mean_y_mg;
 	int16_t mean_z_mg;
-
 	uint16_t rms_mg;
 	uint16_t peak_mg;
 };
@@ -121,49 +112,33 @@ struct app_state {
 	bool short_press_pending;
 	uint32_t first_short_press_time_ms;
 	bool second_click_in_progress;
-
 	uint32_t double_click_blink_remaining;
 
 	uint16_t accel_ble_sample_counter;
+	uint8_t accel_settling_samples_remaining;
 	struct accel_window accel_window;
 	struct vibration_result vibration;
 
 	enum app_runtime_state runtime_state;
 	enum app_wake_reason last_wake_reason;
 	uint32_t state_transition_count;
-
 	enum app_mode mode;
 };
 
-
-
-
 /* Hardware */
 static const struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
-
 static const struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(LED1_NODE, gpios);
-
 static const struct gpio_dt_spec sw0 = GPIO_DT_SPEC_GET(SW0_NODE, gpios);
-
-
 static struct gpio_callback sw0_cb_data;
 
 /* Application state */
 static struct app_state app;
 
 static const char *app_mode_name(enum app_mode mode);
+static const char *app_runtime_state_name(enum app_runtime_state state);
+static const char *app_wake_reason_name(enum app_wake_reason reason);
+static void app_set_runtime_state(enum app_runtime_state new_state);
 static uint32_t app_uptime_seconds(void);
-
-static const char *app_runtime_state_name(
-	enum app_runtime_state state
-);
-static const char *app_wake_reason_name(
-	enum app_wake_reason reason
-);
-static void app_set_runtime_state(
-	enum app_runtime_state new_state
-);
-
 
 static int app_settings_set(const char *name,
 				size_t len,
@@ -179,7 +154,7 @@ static int app_settings_set(const char *name,
 
 	if (len != sizeof(saved_mode)) {
 		LOG_WRN("Invalid saved application mode length: %u",
-			(unsigned int) len);
+			(unsigned int)len);
 		return -EINVAL;
 	}
 
@@ -222,19 +197,13 @@ static int app_save_mode(void);
 
 static void app_accel_sampling_start(void);
 static void app_accel_sampling_stop(void);
-
+static void app_accel_window_reset(void);
 static void app_accel_motion_detected(void);
-
 static void app_enter_idle(void);
-
-static void app_start_measurement(
-	enum app_wake_reason reason);
-
+static void app_start_measurement(enum app_wake_reason reason);
 static void app_finish_measurement(void);
-
-static void app_apply_mode_runtime(
-	enum app_wake_reason reason);
-
+static void app_apply_mode_runtime(enum app_wake_reason reason);
+static void app_handle_mode_request(enum app_mode requested_mode);
 
 SETTINGS_STATIC_HANDLER_DEFINE(app_settings,
 			       APP_SETTINGS_SUBTREE,
@@ -343,66 +312,62 @@ static const char *app_mode_name(enum app_mode mode)
 	}
 }
 
-static const char *app_runtime_state_name(
-	enum app_runtime_state state
-)
+static const char *app_runtime_state_name(enum app_runtime_state state)
 {
-	switch(state) {
-		case APP_STATE_BOOT:
-			return "BOOT";
+	switch (state) {
+	case APP_STATE_BOOT:
+		return "BOOT";
 
-		case APP_STATE_IDLE:
-			return "IDLE";
-		
-		case APP_STATE_MEASURING:
-			return "MEASURING";
+	case APP_STATE_IDLE:
+		return "IDLE";
 
-		case APP_STATE_REPORTING:
-			return "REPORTING";
+	case APP_STATE_MEASURING:
+		return "MEASURING";
 
-		case APP_STATE_ERROR:
-			return "ERROR";
+	case APP_STATE_REPORTING:
+		return "REPORTING";
 
-		default:
-			return "UNKNOWN";
+	case APP_STATE_ERROR:
+		return "ERROR";
+
+	default:
+		return "UNKNOWN";
 	}
 }
 
-static const char *app_wake_reason_name(
-	enum app_wake_reason reason
-)
+static const char *app_wake_reason_name(enum app_wake_reason reason)
 {
-	switch(reason) {
-		case APP_WAKE_REASON_NONE:
-			return "NONE";
-		case APP_WAKE_REASON_BOOT:
-			return "BOOT";
-		case APP_WAKE_REASON_SHAKE:
-			return "SHAKE";
-		case APP_WAKE_REASON_PERIODIC:
-			return "PERIODIC";
-		case APP_WAKE_REASON_NFC:
-			return "NFC";
-		case APP_WAKE_REASON_BLE_COMMAND:
-			return "BLE_COMMAND";
-		default:
-			return "UNKNOWN";
-			
+	switch (reason) {
+	case APP_WAKE_REASON_NONE:
+		return "NONE";
+
+	case APP_WAKE_REASON_BOOT:
+		return "BOOT";
+
+	case APP_WAKE_REASON_SHAKE:
+		return "SHAKE";
+
+	case APP_WAKE_REASON_PERIODIC:
+		return "PERIODIC";
+
+	case APP_WAKE_REASON_NFC:
+		return "NFC";
+
+	case APP_WAKE_REASON_BLE_COMMAND:
+		return "BLE_COMMAND";
+
+	default:
+		return "UNKNOWN";
 	}
 }
 
-
-
-static void app_set_runtime_state(
-	enum app_runtime_state new_state
-)
+static void app_set_runtime_state(enum app_runtime_state new_state)
 {
 	enum app_runtime_state previous_state;
 
-	if (new_state > APP_STATE_ERROR) {
-		LOG_ERR("Invalid runtime state requested: %d",
-			new_state);
-
+	if ((new_state < APP_STATE_BOOT) ||
+	    (new_state > APP_STATE_ERROR)) {
+		LOG_ERR("Invalid runtime state requested: %d", new_state);
 		new_state = APP_STATE_ERROR;
 	}
 
@@ -506,11 +471,6 @@ static void app_ble_mode_requested(enum app_mode mode)
 	app_post_event(APP_EVENT_SET_MODE, (uint32_t)mode);
 }
 
-static uint32_t app_ble_accel_window_count_get(void)
-{
-	return app.accel_window.completed_window_count;
-}
-
 static void app_ble_command_received(enum app_ble_command command)
 {
 	switch (command) {
@@ -555,7 +515,6 @@ static const struct app_ble_callbacks ble_callbacks = {
 	.mode_get = app_ble_mode_get,
 	.button_pressed_get = app_ble_button_pressed_get,
 	.uptime_seconds_get = app_ble_uptime_seconds_get,
-	.accel_window_count_get = app_ble_accel_window_count_get, 
 };
 
 static void app_post_nfc_data_read_event(void)
@@ -602,10 +561,7 @@ static void app_save_mode_work_handler(struct k_work *work)
 
 static void app_accel_motion_detected(void)
 {
-	app_post_event(
-		APP_EVENT_SHAKE_DETECTED,
-		APP_EVENT_VALUE_UNUSED
-	);
+	app_post_event(APP_EVENT_SHAKE_DETECTED, APP_EVENT_VALUE_UNUSED);
 }
 
 static int led_init(void)
@@ -640,15 +596,17 @@ static void app_nfc_callback(void *context,
 	switch (event) {
 	case NFC_T4T_EVENT_FIELD_ON:
 		if (app_nfc_field_on()) {
-		app_post_event(APP_EVENT_NFC_FIELD_ON, 0);
-	}
-	break;
+			app_post_event(APP_EVENT_NFC_FIELD_ON,
+				       APP_EVENT_VALUE_UNUSED);
+		}
+		break;
 
 	case NFC_T4T_EVENT_FIELD_OFF:
 		if (app_nfc_field_off()) {
-		app_post_event(APP_EVENT_NFC_FIELD_OFF, 0);
-	}
-	break;
+			app_post_event(APP_EVENT_NFC_FIELD_OFF,
+				       APP_EVENT_VALUE_UNUSED);
+		}
+		break;
 
 	case NFC_T4T_EVENT_NDEF_READ:
 		app_post_nfc_data_read_event();
@@ -772,10 +730,12 @@ static void double_click_blink_handler(struct k_work *work)
 
 static void button_debounce_handler(struct k_work *work)
 {
+	int button_state;
+	int ret;
+
 	ARG_UNUSED(work);
 
-	int button_state = gpio_pin_get_dt(&sw0);
-
+	button_state = gpio_pin_get_dt(&sw0);
 	if (button_state < 0) {
 		LOG_ERR("Failed to read SW0 during debounce: %d", button_state);
 		goto reenable_interrupt;
@@ -796,14 +756,12 @@ static void button_debounce_handler(struct k_work *work)
 		app_post_button_released_event((uint32_t)button_state);
 	}
 
-reenable_interrupt: {
-	int ret = gpio_pin_interrupt_configure_dt(&sw0, GPIO_INT_EDGE_BOTH);
-
+reenable_interrupt:
+	ret = gpio_pin_interrupt_configure_dt(&sw0, GPIO_INT_EDGE_BOTH);
 	if (ret < 0) {
 		LOG_ERR("Failed to re-enable SW0 interrupt: %d", ret);
 		return;
 	}
-}
 
 	LOG_DBG("Button interrupt re-enabled.");
 }
@@ -892,76 +850,62 @@ static void app_timers_start(void)
 
 static int app_init(void)
 {
-	app.mode = APP_MODE_NORMAL;
+	int ret;
 
+	app.mode = APP_MODE_NORMAL;
 	app.runtime_state = APP_STATE_BOOT;
 	app.last_wake_reason = APP_WAKE_REASON_BOOT;
 	app.state_transition_count = 0U;
 
-	int ret = app_gpio_init();
-
+	ret = app_gpio_init();
 	if (ret < 0) {
 		LOG_ERR("Failed to initialize GPIOs: %d", ret);
 		return ret;
 	}
 
 	ret = gpio_pin_get_dt(&sw0);
-
 	if (ret < 0) {
 		LOG_ERR("Failed to read initial SW0 state: %d", ret);
 		return ret;
 	}
 
 	app.last_button_state = ret;
-
 	LOG_INF("Initial button state: %d", app.last_button_state);
 
 	ret = sensor_accel_init();
-
 	if (ret < 0) {
 		LOG_ERR("Failed to initialize accelerometer: %d", ret);
 		return ret;
 	}
 
-	ret = app_ble_start(&ble_callbacks);
+	ret = sensor_accel_motion_init(app_accel_motion_detected,
+				       ACCEL_WAKE_THRESHOLD_MG);
+	if (ret < 0) {
+		LOG_ERR("Failed to initialize accelerometer motion detection: %d",
+			ret);
+		return ret;
+	}
 
+	/* app_ble_start() loads Bluetooth and application settings. */
+	ret = app_ble_start(&ble_callbacks);
 	if (ret < 0) {
 		LOG_ERR("Failed to initialize Bluetooth module: %d", ret);
 		return ret;
 	}
 
 	ret = app_nfc_init();
-
-	if (ret < 0){
+	if (ret < 0) {
 		LOG_ERR("Failed to initialize NFC: %d", ret);
 		return ret;
 	}
 
-	ret = sensor_accel_init();
-
-	if (ret < 0) {
-		LOG_ERR("Failed to initialize accelerometer: %d",
-			ret);
-		return ret;
-	}
-
+	/* Apply the mode restored by settings_load(). */
 	app_apply_mode_runtime(APP_WAKE_REASON_BOOT);
-	app_timers_start();
-
-	ret = sensor_accel_motion_init(
-		app_accel_motion_detected,
-		ACCEL_WAKE_THRESHOLD_MG
-	);
-
-	if (ret < 0) {
-		LOG_ERR("Failed to initialize accelerometer: %d",
-		ret);
-		return ret;
+	if (app.runtime_state == APP_STATE_ERROR) {
+		return -EIO;
 	}
 
-	
-	
-
+	app_timers_start();
 	return 0;
 }
 
@@ -990,41 +934,30 @@ static void app_log_startup_config(void)
 
 static void app_mode_next(void)
 {
-	int ret;
+	enum app_mode next_mode;
 
 	switch (app.mode) {
 	case APP_MODE_NORMAL:
-		app.mode = APP_MODE_CONFIG;
+		next_mode = APP_MODE_CONFIG;
 		break;
 
 	case APP_MODE_CONFIG:
-		app.mode = APP_MODE_DIAGNOSTIC;
+		next_mode = APP_MODE_DIAGNOSTIC;
 		break;
 
 	case APP_MODE_DIAGNOSTIC:
 	default:
-		app.mode = APP_MODE_NORMAL;
+		next_mode = APP_MODE_NORMAL;
 		break;
 	}
 
-	LOG_INF("Application mode changed to: %s", app_mode_name(app.mode));
-	app_apply_mode_runtime(APP_WAKE_REASON_NONE);
-
-	ret = k_work_submit(&app_save_mode_work);
-	if (ret < 0) {
-		LOG_ERR("Failed to submit application mode save work: %d", ret);
-	}
-
-	(void)app_ble_notify_mode(app.mode);
-	app_nfc_update_request(app.mode, app.single_click_count);
+	app_handle_mode_request(next_mode);
 }
 
 static void app_handle_single_click(void)
 {
 	switch (app.mode) {
-	case APP_MODE_NORMAL: {
-		
-
+	case APP_MODE_NORMAL:
 		app.single_click_count++;
 		led0_toggle();
 
@@ -1034,7 +967,6 @@ static void app_handle_single_click(void)
 		LOG_INF("Single click handled. Count: %u",
 			app.single_click_count);
 		break;
-	}
 
 	case APP_MODE_CONFIG:
 		LOG_INF("Single click handled in CONFIG mode. Count: %u",
@@ -1102,13 +1034,19 @@ static void app_handle_short_press(const struct app_event *event)
 		event->value);
 }
 
+static void app_accel_window_reset(void)
+{
+	app.accel_window.sample_index = 0U;
+	app.accel_ble_sample_counter = 0U;
+	app.accel_settling_samples_remaining = 0U;
+}
+
 static void app_accel_sampling_start(void)
 {
 	k_timer_start(
 		&accel_sample_timer,
 		K_MSEC(ACCEL_SAMPLE_INTERVAL_MS),
 		K_MSEC(ACCEL_SAMPLE_INTERVAL_MS));
-	
 }
 
 static void app_accel_sampling_stop(void)
@@ -1122,11 +1060,8 @@ static void app_enter_idle(void)
 
 	app_accel_sampling_stop();
 
-	/*
-	 * Every future wake begins with a completely new window.
-	 */
-	app.accel_window.sample_index = 0U;
-	app.accel_ble_sample_counter = 0U;
+	/* Every future wake begins with a completely new window. */
+	app_accel_window_reset();
 
 	/*
 	 * Ensure the interrupt route is disabled before changing
@@ -1207,8 +1142,7 @@ static void app_enter_idle(void)
 	}
 }
 
-static void app_start_measurement(
-	enum app_wake_reason reason)
+static void app_start_measurement(enum app_wake_reason reason)
 {
 	int ret;
 
@@ -1239,8 +1173,7 @@ static void app_start_measurement(
 	}
 
 	ret = sensor_accel_profile_set(
-		SENSOR_ACCEL_PROFILE_MEASUREMENT
-	);
+		SENSOR_ACCEL_PROFILE_MEASUREMENT);
 
 	if (ret < 0) {
 		LOG_ERR("Failed to apply accelerometer "
@@ -1255,22 +1188,23 @@ static void app_start_measurement(
 		app.last_wake_reason = reason;
 	}
 
-	app.accel_window.sample_index = 0U;
-	app.accel_ble_sample_counter = 0U;
+	app_accel_window_reset();
+	app.accel_settling_samples_remaining =
+		ACCEL_SETTLING_SAMPLE_COUNT;
 
 	app_set_runtime_state(APP_STATE_MEASURING);
 
 	app_accel_sampling_start();
 
 	LOG_INF("Accelerometer measurement started. Reason: %s",
-		app_wake_reason_name(
-			app.last_wake_reason));
+		app_wake_reason_name(app.last_wake_reason));
 }
 
 static void app_finish_measurement(void)
 {
-	bool continuous_measurement = 
+	bool continuous_measurement =
 		(app.mode == APP_MODE_DIAGNOSTIC);
+	int ret;
 
 	if (!continuous_measurement) {
 		app_accel_sampling_stop();
@@ -1278,22 +1212,17 @@ static void app_finish_measurement(void)
 
 	app_set_runtime_state(APP_STATE_REPORTING);
 
-	int ret = app_ble_update_vibration(
+	ret = app_ble_update_vibration(
 		app.vibration.mean_x_mg,
 		app.vibration.mean_y_mg,
 		app.vibration.mean_z_mg,
 		app.vibration.rms_mg,
 		app.vibration.peak_mg,
-		(uint16_t)
-			app.accel_window.completed_window_count
-	);
+		(uint16_t)app.accel_window.completed_window_count);
 
-	if ((ret < 0 ) &&
-		(ret != -ENOTCONN) &&
-		(ret != -EACCES)) {
-			LOG_WRN("Failed to update BLE vibration result: %d",
-				ret);
-		}
+	if ((ret < 0) && (ret != -ENOTCONN) && (ret != -EACCES)) {
+		LOG_WRN("Failed to update BLE vibration result: %d", ret);
+	}
 
 	if (continuous_measurement) {
 		app_set_runtime_state(APP_STATE_MEASURING);
@@ -1306,16 +1235,15 @@ static void app_finish_measurement(void)
 static bool app_accel_window_add_sample(
 	const struct sensor_accel_sample *sample)
 {
+	uint16_t index;
+
 	if (sample == NULL) {
 		return false;
 	}
 
-	uint16_t index =app.accel_window.sample_index;
-
+	index = app.accel_window.sample_index;
 	if (index >= ACCEL_WINDOW_SAMPLE_COUNT) {
-		LOG_ERR("accelerometer window out of range: %u",
-			index);
-
+		LOG_ERR("Accelerometer window index out of range: %u", index);
 		app.accel_window.sample_index = 0U;
 		index = 0U;
 	}
@@ -1325,15 +1253,12 @@ static bool app_accel_window_add_sample(
 	app.accel_window.z_mg[index] = (int16_t)sample->z_mg;
 
 	app.accel_window.sample_index++;
-
-	if (app.accel_window.sample_index < 
-		ACCEL_WINDOW_SAMPLE_COUNT) {
-			return false;
-		}
+	if (app.accel_window.sample_index < ACCEL_WINDOW_SAMPLE_COUNT) {
+		return false;
+	}
 
 	app.accel_window.sample_index = 0U;
 	app.accel_window.completed_window_count++;
-
 	return true;
 }
 
@@ -1431,28 +1356,132 @@ static void app_accel_window_calculate(void)
 			peak_magnitude_squared);
 }
 
-static void app_apply_mode_runtime(
-	enum app_wake_reason reason
-)
+static void app_apply_mode_runtime(enum app_wake_reason reason)
 {
-	switch(app.mode) {
-		case APP_MODE_DIAGNOSTIC:
-			app_start_measurement(reason);
-			break;
-		case APP_MODE_NORMAL:
-		case APP_MODE_CONFIG:
-			app_enter_idle();
-			break;
+	switch (app.mode) {
+	case APP_MODE_DIAGNOSTIC:
+		app_start_measurement(reason);
+		break;
 
-		default:
-		LOG_ERR("Cannot apply unknow application mode: %d",
-			app.mode);
+	case APP_MODE_NORMAL:
+	case APP_MODE_CONFIG:
+		app_enter_idle();
+		break;
 
+	default:
+		LOG_ERR("Cannot apply unknown application mode: %d", app.mode);
 		app_set_runtime_state(APP_STATE_ERROR);
 		break;
 	}
 }
 
+
+static void app_handle_accel_sample(void)
+{
+	struct sensor_accel_sample sample;
+	bool window_complete;
+	int ret;
+
+	if (app.runtime_state != APP_STATE_MEASURING) {
+		LOG_DBG("Ignoring accelerometer sample event in state %s",
+			app_runtime_state_name(app.runtime_state));
+		return;
+	}
+
+	ret = sensor_accel_read(&sample);
+	if (ret < 0) {
+		LOG_ERR("Failed to read accelerometer: %d", ret);
+		return;
+	}
+
+	/*
+	 * Discard the first samples after changing from the motion profile
+	 * to the 100 Hz measurement profile. This keeps profile-transition
+	 * data out of the vibration window.
+	 */
+	if (app.accel_settling_samples_remaining > 0U) {
+		app.accel_settling_samples_remaining--;
+		return;
+	}
+
+	window_complete = app_accel_window_add_sample(&sample);
+	app.accel_ble_sample_counter++;
+
+	if (app.accel_ble_sample_counter >=
+	    ACCEL_BLE_REPORT_SAMPLE_COUNT) {
+		app.accel_ble_sample_counter = 0U;
+
+		(void)app_ble_update_accel((int16_t)sample.x_mg,
+					   (int16_t)sample.y_mg,
+					   (int16_t)sample.z_mg);
+	}
+
+	if (!window_complete) {
+		return;
+	}
+
+	app_accel_window_calculate();
+
+	LOG_INF("Window %u: mean=(%d, %d, %d) mg, "
+		"RMS=%u mg, peak=%u mg",
+		app.accel_window.completed_window_count,
+		app.vibration.mean_x_mg,
+		app.vibration.mean_y_mg,
+		app.vibration.mean_z_mg,
+		app.vibration.rms_mg,
+		app.vibration.peak_mg);
+
+	app_finish_measurement();
+}
+
+static void app_handle_mode_request(enum app_mode requested_mode)
+{
+	int ret;
+
+	if ((requested_mode < APP_MODE_NORMAL) ||
+	    (requested_mode > APP_MODE_DIAGNOSTIC)) {
+		LOG_WRN("Invalid application mode event value: %u",
+			(uint32_t)requested_mode);
+		return;
+	}
+
+	if (requested_mode == app.mode) {
+		LOG_INF("Application mode already set to: %s",
+			app_mode_name(app.mode));
+		return;
+	}
+
+	app.mode = requested_mode;
+	LOG_INF("Application mode changed to: %s", app_mode_name(app.mode));
+
+	app_apply_mode_runtime(APP_WAKE_REASON_NONE);
+
+	ret = k_work_submit(&app_save_mode_work);
+	if (ret < 0) {
+		LOG_ERR("Failed to submit application mode save work: %d", ret);
+	}
+
+	(void)app_ble_notify_mode(app.mode);
+	app_nfc_update_request(app.mode, app.single_click_count);
+}
+
+static void app_handle_shake_detected(void)
+{
+	if (app.mode != APP_MODE_NORMAL) {
+		LOG_DBG("Shake ignored in application mode %s",
+			app_mode_name(app.mode));
+		return;
+	}
+
+	if (app.runtime_state != APP_STATE_IDLE) {
+		LOG_DBG("Shake ignored in runtime state %s",
+			app_runtime_state_name(app.runtime_state));
+		return;
+	}
+
+	LOG_INF("Shake detected");
+	app_start_measurement(APP_WAKE_REASON_SHAKE);
+}
 
 static void app_event_handler(const struct app_event *event)
 {
@@ -1505,55 +1534,9 @@ static void app_event_handler(const struct app_event *event)
 		break;
 	}
 
-	case APP_EVENT_ACCEL_SAMPLE: {
-	if (app.runtime_state != APP_STATE_MEASURING) {
-		LOG_DBG("Ignoring accelerometer sample event in state %s",
-			app_runtime_state_name(app.runtime_state));
+	case APP_EVENT_ACCEL_SAMPLE:
+		app_handle_accel_sample();
 		break;
-	}
-
-	struct sensor_accel_sample sample;
-
-	int ret = sensor_accel_read(&sample);
-
-	if (ret < 0) {
-		LOG_ERR("Failed to read accelerometer: %d", ret);
-		break;
-	}
-
-	bool window_complete =
-		app_accel_window_add_sample(&sample);
-
-	app.accel_ble_sample_counter++;
-
-	if (app.accel_ble_sample_counter >=
-	    ACCEL_BLE_REPORT_SAMPLE_COUNT) {
-
-		app.accel_ble_sample_counter = 0U;
-
-		(void)app_ble_update_accel(
-			(int16_t)sample.x_mg,
-			(int16_t)sample.y_mg,
-			(int16_t)sample.z_mg);
-	}
-
-	if (window_complete) {
-		app_accel_window_calculate();
-
-		LOG_INF("Window %u: mean=(%d, %d, %d) mg, "
-			"RMS=%u mg, peak=%u mg",
-			app.accel_window.completed_window_count,
-			app.vibration.mean_x_mg,
-			app.vibration.mean_y_mg,
-			app.vibration.mean_z_mg,
-			app.vibration.rms_mg,
-			app.vibration.peak_mg);
-
-		app_finish_measurement();
-	}
-
-	break;
-}
 
 	case APP_EVENT_STATUS_REPORT: {
 		app.last_status_uptime_seconds = event->value;
@@ -1586,39 +1569,9 @@ static void app_event_handler(const struct app_event *event)
 		break;
 	}
 
-	case APP_EVENT_SET_MODE: {
-		enum app_mode requested_mode = (enum app_mode)event->value;
-		int ret;
-
-		if (requested_mode > APP_MODE_DIAGNOSTIC) {
-			LOG_WRN("Invalid application mode event value: %u",
-				event->value);
-			break;
-		}
-
-		if (requested_mode == app.mode) {
-			LOG_INF("Application mode already set to: %s",
-				app_mode_name(app.mode));
-			break;
-		}
-
-		app.mode = requested_mode;
-
-		LOG_INF("Application mode changed to: %s",
-			app_mode_name(app.mode));
-
-		app_apply_mode_runtime(APP_WAKE_REASON_NONE);
-
-		ret = k_work_submit(&app_save_mode_work);
-		if (ret < 0) {
-			LOG_ERR("Failed to submit application mode save work: %d",
-				ret);
-		}
-
-		(void)app_ble_notify_mode(app.mode);
-		app_nfc_update_request(app.mode, app.single_click_count);
+	case APP_EVENT_SET_MODE:
+		app_handle_mode_request((enum app_mode)event->value);
 		break;
-	}
 
 	case APP_EVENT_NFC_FIELD_ON:
 		LOG_INF("NFC field detected");
@@ -1633,28 +1586,13 @@ static void app_event_handler(const struct app_event *event)
 		break;
 
 	case APP_EVENT_NFC_DATA_UPDATED:
-		LOG_INF("NFC write received: %u-byte NDEF message", 
+		LOG_INF("NFC write received: %u-byte NDEF message",
 			event->value);
 		break;
+
 	case APP_EVENT_SHAKE_DETECTED:
-		if (app.mode !=APP_MODE_NORMAL) {
-			LOG_DBG("Shake ignored in application mode %s",
-				app_mode_name(app.mode));
-			break;
-		}
-	if (app.runtime_state != APP_STATE_IDLE) {
-		LOG_DBG("Shake ignored in runtime state %s",
-			app_runtime_state_name(
-				app.runtime_state));
+		app_handle_shake_detected();
 		break;
-	}
-
-	LOG_INF("Shake detected");
-
-	app_start_measurement(
-		APP_WAKE_REASON_SHAKE);
-
-	break;
 
 	default:
 		LOG_WRN("Unknown event type: %d (%s)",

@@ -18,7 +18,6 @@ void app_nfc_update_request(enum app_mode mode,
 
 bool app_nfc_field_on(void);
 bool app_nfc_field_off(void);
-
 void app_nfc_write_received(size_t data_length);
 
-#endif	
+#endif
