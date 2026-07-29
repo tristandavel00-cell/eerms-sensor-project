@@ -10,6 +10,7 @@
 
 #include <nfc/ndef/msg.h>
 #include <nfc/ndef/text_rec.h>
+#include <nfc/ndef/uri_rec.h>
 #include <nfc_t4t_lib.h>
 #include <nfc/t4t/ndef_file.h>
 
@@ -21,6 +22,9 @@ LOG_MODULE_REGISTER(app_nfc, LOG_LEVEL_DBG);
 #define NFC_TEXT_BUFFER_SIZE 96
 #define NFC_LANGUAGE_CODE "en"
 #define NFC_UPDATE_DELAY_MS 50
+
+static const uint8_t nfc_web_url[] = 
+	"https://web.eerms.co.za/";
 
 static uint8_t nfc_ndef_buffer[NFC_NDEF_BUFFER_SIZE];
 static uint32_t nfc_ndef_length;
@@ -121,6 +125,13 @@ static int app_nfc_update_payload(enum app_mode mode,
 
 	static const uint8_t language_code[] = NFC_LANGUAGE_CODE;
 
+		NFC_NDEF_URI_RECORD_DESC_DEF(uri_record,
+				     NFC_URI_NONE,
+				     nfc_web_url,
+				     sizeof(nfc_web_url) - 1U);
+
+	
+
 	NFC_NDEF_TEXT_RECORD_DESC_DEF(text_record,
 				      UTF_8,
 				      language_code,
@@ -128,7 +139,16 @@ static int app_nfc_update_payload(enum app_mode mode,
 				      nfc_text_buffer,
 				      (uint32_t)text_length);
 
-	NFC_NDEF_MSG_DEF(nfc_message, 1);
+	NFC_NDEF_MSG_DEF(nfc_message, 2);
+
+		err = nfc_ndef_msg_record_add(
+		&NFC_NDEF_MSG(nfc_message),
+		&NFC_NDEF_URI_RECORD_DESC(uri_record));
+
+	if (err < 0) {
+		LOG_ERR("Failed to add NFC URI record: %d", err);
+		return err;
+	}
 
 	err = nfc_ndef_msg_record_add(
 		&NFC_NDEF_MSG(nfc_message),
@@ -189,7 +209,7 @@ static int app_nfc_update_payload(enum app_mode mode,
 
 	nfc_emulation_running = true;
 
-	LOG_INF("NFC payload updated: mode=%s, clicks=%u",
+	LOG_INF("NFC payload updated with URI and status: mode=%s, clicks=%u",
 	app_nfc_mode_name(mode),
 	single_click_count);
 

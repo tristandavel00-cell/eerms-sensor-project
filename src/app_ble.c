@@ -21,6 +21,7 @@ LOG_MODULE_REGISTER(app_ble, LOG_LEVEL_DBG);
 #define APP_STATUS_BUTTON_OFFSET      1
 #define APP_STATUS_CLICK_COUNT_OFFSET 4
 #define APP_STATUS_UPTIME_OFFSET      8
+#define VIBRATION_PACKET_SIZE 12
 
 #define BT_UUID_BUTTON_SERVICE_VAL \
 	BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x56789abcdef0)
@@ -32,11 +33,28 @@ LOG_MODULE_REGISTER(app_ble, LOG_LEVEL_DBG);
 	BT_UUID_128_ENCODE(0x1234567b, 0x1234, 0x5678, 0x1234, 0x56789abcdef0)
 #define BT_UUID_APP_COMMAND_VAL \
 	BT_UUID_128_ENCODE(0x1234567c, 0x1234, 0x5678, 0x1234, 0x56789abcdef0)
+#define BT_UUID_ACCEL_DATA_VAL \
+	BT_UUID_128_ENCODE(0x1234567d, 0x1234, 0x5678, 0x1234, 0x56789abcdef0)
+#define BT_UUID_VIBRATION_DATA_VAL \
+	BT_UUID_128_ENCODE(0x1234567e, 0x1234, 0x5678, 0x1234, 0x56789abcdef0)
 
 static const struct app_ble_callbacks *app_callbacks;
 static struct bt_conn *current_conn;
 static bool single_click_notifications_enabled;
 static bool app_mode_notifications_enabled;
+static bool accel_notifications_enabled;
+static int16_t latest_accel_x_mg;
+static int16_t latest_accel_y_mg;
+static int16_t latest_accel_z_mg;
+static bool vibration_notifications_enabled;
+
+static int16_t latest_mean_x_mg;
+static int16_t latest_mean_y_mg;
+static int16_t latest_mean_z_mg;
+
+static uint16_t latest_rms_mg;
+static uint16_t latest_peak_mg;
+static uint16_t latest_window_count;
 
 static struct bt_uuid_128 button_service_uuid =
 	BT_UUID_INIT_128(BT_UUID_BUTTON_SERVICE_VAL);
@@ -48,6 +66,10 @@ static struct bt_uuid_128 app_status_uuid =
 	BT_UUID_INIT_128(BT_UUID_APP_STATUS_VAL);
 static struct bt_uuid_128 app_command_uuid =
 	BT_UUID_INIT_128(BT_UUID_APP_COMMAND_VAL);
+static struct bt_uuid_128 accel_data_uuid = 
+	BT_UUID_INIT_128(BT_UUID_ACCEL_DATA_VAL);
+static struct bt_uuid_128 vibration_data_uuid =
+	BT_UUID_INIT_128(BT_UUID_VIBRATION_DATA_VAL);
 
 static const struct bt_data advertising_data[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR),
@@ -97,6 +119,16 @@ static ssize_t write_app_command(struct bt_conn *conn,
 				 uint16_t len,
 				 uint16_t offset,
 				 uint8_t flags);
+static ssize_t read_accel_data(struct bt_conn *conn,
+				const struct bt_gatt_attr *attr,
+				void *buf,
+				uint16_t len,
+				uint16_t offset);
+static ssize_t read_vibration_data(struct bt_conn *conn,
+				   const struct bt_gatt_attr *attr,
+				   void *buf,
+				   uint16_t len,
+				   uint16_t offset);
 
 static void single_click_ccc_changed(const struct bt_gatt_attr *attr,
 				     uint16_t value)
@@ -114,6 +146,31 @@ static void app_mode_ccc_changed(const struct bt_gatt_attr *attr,
 	app_mode_notifications_enabled = (value == BT_GATT_CCC_NOTIFY);
 	LOG_INF("Application mode notifications %s",
 		app_mode_notifications_enabled ? "enabled" : "disabled");
+}
+
+static void accel_ccc_changed(const struct bt_gatt_attr *attr,
+				uint16_t value)
+{
+	ARG_UNUSED(attr);
+
+	accel_notifications_enabled = 
+		(value == BT_GATT_CCC_NOTIFY);
+
+	LOG_INF("Accelerometer notifications %s",
+		accel_notifications_enabled ? 
+			"enabled" : "disabled");
+}
+static void vibration_ccc_changed(const struct bt_gatt_attr *attr,
+				  uint16_t value)
+{
+	ARG_UNUSED(attr);
+
+	vibration_notifications_enabled =
+		(value == BT_GATT_CCC_NOTIFY);
+
+	LOG_INF("Vibration notifications %s",
+		vibration_notifications_enabled ?
+			"enabled" : "disabled");
 }
 
 BT_GATT_SERVICE_DEFINE(
@@ -139,8 +196,44 @@ BT_GATT_SERVICE_DEFINE(
 	BT_GATT_CHARACTERISTIC(&app_command_uuid.uuid,
 			       BT_GATT_CHRC_WRITE,
 			       BT_GATT_PERM_WRITE,
-			       NULL, write_app_command, NULL)
+			       NULL, write_app_command, NULL),
+	BT_GATT_CHARACTERISTIC(&accel_data_uuid.uuid,
+			       BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
+			       BT_GATT_PERM_READ,
+			       read_accel_data, NULL, NULL),
+
+	BT_GATT_CCC(accel_ccc_changed,
+		    BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+
+	BT_GATT_CHARACTERISTIC(&vibration_data_uuid.uuid,
+			       BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
+			       BT_GATT_PERM_READ,
+			       read_vibration_data, NULL, NULL),
+
+	BT_GATT_CCC(vibration_ccc_changed,
+		    BT_GATT_PERM_READ | BT_GATT_PERM_WRITE)
 );
+
+static void vibration_packet_build(uint8_t *packet)
+{
+	sys_put_le16((uint16_t)latest_mean_x_mg,
+		     &packet[0]);
+
+	sys_put_le16((uint16_t)latest_mean_y_mg,
+		     &packet[2]);
+
+	sys_put_le16((uint16_t)latest_mean_z_mg,
+		     &packet[4]);
+
+	sys_put_le16(latest_rms_mg,
+		     &packet[6]);
+
+	sys_put_le16(latest_peak_mg,
+		     &packet[8]);
+
+	sys_put_le16(latest_window_count,
+		     &packet[10]);
+}
 
 static int advertising_start(void)
 {
@@ -348,6 +441,49 @@ static ssize_t read_app_status(struct bt_conn *conn,
 				 packet, sizeof(packet));
 }
 
+static ssize_t read_accel_data(struct bt_conn *conn,
+					const struct bt_gatt_attr *attr,
+					void *buf,
+					uint16_t len,
+					uint16_t offset)
+{
+	uint8_t packet[6];
+
+	sys_put_le16((uint16_t)latest_accel_x_mg,
+				&packet[0]);
+	sys_put_le16((uint16_t)latest_accel_y_mg,
+				&packet[2]);
+	sys_put_le16((uint16_t)latest_accel_z_mg,
+				&packet[4]);
+
+	return bt_gatt_attr_read(conn,
+				attr,
+				buf,
+				len,
+				offset,
+				packet,
+				sizeof(packet));
+}
+
+static ssize_t read_vibration_data(struct bt_conn *conn,
+				   const struct bt_gatt_attr *attr,
+				   void *buf,
+				   uint16_t len,
+				   uint16_t offset)
+{
+	uint8_t packet[VIBRATION_PACKET_SIZE];
+
+	vibration_packet_build(packet);
+
+	return bt_gatt_attr_read(conn,
+				 attr,
+				 buf,
+				 len,
+				 offset,
+				 packet,
+				 sizeof(packet));
+}
+
 static ssize_t write_app_command(struct bt_conn *conn,
 				 const struct bt_gatt_attr *attr,
 				 const void *buf,
@@ -388,7 +524,8 @@ int app_ble_start(const struct app_ble_callbacks *callbacks)
 	    (callbacks->click_count_get == NULL) ||
 	    (callbacks->mode_get == NULL) ||
 	    (callbacks->button_pressed_get == NULL) ||
-	    (callbacks->uptime_seconds_get == NULL)) {
+	    (callbacks->uptime_seconds_get == NULL) || 
+		(callbacks->accel_window_count_get == NULL)) {
 		return -EINVAL;
 	}
 
@@ -469,4 +606,98 @@ int app_ble_notify_mode(enum app_mode mode)
 bool app_ble_is_connected(void)
 {
 	return current_conn != NULL;
+}
+
+int app_ble_update_accel(int16_t x_mg,
+					int16_t y_mg,
+					int16_t z_mg)
+{
+	uint8_t packet[6];
+	latest_accel_x_mg = x_mg;
+	latest_accel_x_mg = y_mg;
+	latest_accel_x_mg = z_mg;
+
+	if(current_conn == NULL) {
+		LOG_DBG("Accelerometer notification skipped: "
+			"no active connection");
+		return -EACCES;
+	}
+
+	sys_put_le16((uint16_t)x_mg, &packet[0]);
+	sys_put_le16((uint16_t)y_mg, &packet[2]);
+	sys_put_le16((uint16_t)z_mg, &packet[4]);
+
+	int err = bt_gatt_notify(current_conn,
+				&button_service.attrs[12],
+				packet,
+				sizeof(packet));
+
+	if (err < 0) {
+		LOG_ERR("Failed to send accelerometer notification: %d",
+			err);
+		return err;
+	}
+
+	LOG_DBG("Accelerometer notification sent: "
+		"X=%d, Y=%d, Z=%d",
+		x_mg,
+		y_mg,
+		z_mg);
+
+	return 0;
+
+}
+
+int app_ble_update_vibration(int16_t mean_x_mg,
+			     int16_t mean_y_mg,
+			     int16_t mean_z_mg,
+			     uint16_t rms_mg,
+			     uint16_t peak_mg,
+			     uint16_t window_count)
+{
+	uint8_t packet[VIBRATION_PACKET_SIZE];
+
+	latest_mean_x_mg = mean_x_mg;
+	latest_mean_y_mg = mean_y_mg;
+	latest_mean_z_mg = mean_z_mg;
+
+	latest_rms_mg = rms_mg;
+	latest_peak_mg = peak_mg;
+	latest_window_count = window_count;
+
+	if (current_conn == NULL) {
+		LOG_DBG("Vibration notification skipped: no connection");
+		return -ENOTCONN;
+	}
+
+	if (!vibration_notifications_enabled) {
+		LOG_DBG("Vibration notification skipped: disabled");
+		return -EACCES;
+	}
+
+	vibration_packet_build(packet);
+
+	int err = bt_gatt_notify_uuid(
+		current_conn,
+		&vibration_data_uuid.uuid,
+		button_service.attrs,
+		packet,
+		sizeof(packet));
+
+	if (err < 0) {
+		LOG_ERR("Failed to send vibration notification: %d",
+			err);
+		return err;
+	}
+
+	LOG_DBG("Vibration notification sent: "
+		"mean=(%d, %d, %d), RMS=%u, peak=%u, window=%u",
+		mean_x_mg,
+		mean_y_mg,
+		mean_z_mg,
+		rms_mg,
+		peak_mg,
+		window_count);
+
+	return 0;
 }
