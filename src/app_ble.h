@@ -15,14 +15,18 @@ struct app_ble_callbacks {
 	void (*mode_requested)(enum app_mode mode);
 	void (*command_received)(enum app_ble_command command);
 
-	uint32_t (*click_count_get)(void);
 	enum app_mode (*mode_get)(void);
-	bool (*button_pressed_get)(void);
+
+	enum app_runtime_state (*runtime_state_get)(void);
+	enum app_wake_reason (*wake_reason_get)(void);
+	uint16_t (*error_code_get)(void);
+
+	uint32_t (*state_transition_count_get)(void);
 	uint32_t (*uptime_seconds_get)(void);
+	uint32_t (*accel_window_count_get)(void);
 };
 
 int app_ble_start(const struct app_ble_callbacks *callbacks);
-int app_ble_notify_click_count(uint32_t click_count);
 int app_ble_notify_mode(enum app_mode mode);
 
 int app_ble_update_accel(int16_t x_mg,
@@ -35,6 +39,9 @@ int app_ble_update_vibration(int16_t mean_x_mg,
 			     uint16_t rms_mg,
 			     uint16_t peak_mg,
 			     uint16_t window_count);
+
+int app_ble_set_advertising(bool enabled);
+int app_ble_disconnect(void);
 
 bool app_ble_is_connected(void);
 

@@ -46,6 +46,7 @@ LOG_MODULE_REGISTER(button_app, LOG_LEVEL_DBG);
 #define ACCEL_SAMPLE_INTERVAL_MS       10
 #define ACCEL_BLE_REPORT_INTERVAL_MS   500
 #define ACCEL_WAKE_THRESHOLD_MG        250U
+#define NORMAL_REPORT_WINDOW_MS		   30000u
 #define ACCEL_SETTLING_SAMPLE_COUNT    4U
 #define ACCEL_WINDOW_SAMPLE_COUNT      100
 #define ACCEL_BLE_REPORT_SAMPLE_COUNT \
@@ -70,6 +71,7 @@ enum app_event_type {
 	APP_EVENT_HEARTBEAT,
 	APP_EVENT_ACCEL_SAMPLE,
 	APP_EVENT_SHAKE_DETECTED,
+	APP_EVENT_REPORT_TIMEOUT,
 	APP_EVENT_STATUS_REPORT,
 	APP_EVENT_RESET_COUNTERS,
 	APP_EVENT_SET_MODE,
@@ -122,6 +124,7 @@ struct app_state {
 	enum app_runtime_state runtime_state;
 	enum app_wake_reason last_wake_reason;
 	uint32_t state_transition_count;
+	enum app_error_code current_error;
 	enum app_mode mode;
 };
 
@@ -187,6 +190,7 @@ static int app_settings_set(const char *name,
 static void heartbeat_timer_handler(struct k_timer *timer);
 static void accel_sample_timer_handler(struct k_timer *timer);
 static void single_click_timer_handler(struct k_timer *timer);
+static void report_timer_handler(struct k_timer *timer);
 static void button_debounce_handler(struct k_work *work);
 static void double_click_blink_handler(struct k_work *work);
 static void app_save_mode_work_handler(struct k_work *work);
@@ -197,11 +201,15 @@ static int app_save_mode(void);
 
 static void app_accel_sampling_start(void);
 static void app_accel_sampling_stop(void);
+static void app_report_window_cancel(void);
+static int app_report_window_start(void);
+static void app_handle_report_timout(void);
 static void app_accel_window_reset(void);
 static void app_accel_motion_detected(void);
 static void app_enter_idle(void);
 static void app_start_measurement(enum app_wake_reason reason);
 static void app_finish_measurement(void);
+static int app_apply_ble_policy(void);
 static void app_apply_mode_runtime(enum app_wake_reason reason);
 static void app_handle_mode_request(enum app_mode requested_mode);
 
@@ -223,6 +231,7 @@ K_TIMER_DEFINE(single_click_timer, single_click_timer_handler, NULL);
 K_TIMER_DEFINE(accel_sample_timer,
 	       accel_sample_timer_handler,
 	       NULL);
+K_TIMER_DEFINE(report_timer, report_timer_handler, NULL);
 K_WORK_DEFINE(app_save_mode_work, app_save_mode_work_handler);
 
 K_WORK_DELAYABLE_DEFINE(button_debounce_work, button_debounce_handler);
@@ -289,6 +298,9 @@ static const char *app_event_type_name(enum app_event_type type)
 
 	case APP_EVENT_SHAKE_DETECTED:
 		return "APP_EVENT_SHAKE_DETECTED";
+
+	case APP_EVENT_REPORT_TIMEOUT:
+		return "APP_EVENT_REPORT_TIMEOUT";
 
 	default:
 		return "APP_EVENT_UNKNOWN";
@@ -488,33 +500,61 @@ static void app_ble_command_received(enum app_ble_command command)
 	}
 }
 
-static uint32_t app_ble_click_count_get(void)
-{
-	return app.single_click_count;
-}
 
 static enum app_mode app_ble_mode_get(void)
 {
 	return app.mode;
 }
 
-static bool app_ble_button_pressed_get(void)
-{
-	return app.button_is_pressed;
-}
 
 static uint32_t app_ble_uptime_seconds_get(void)
 {
 	return app_uptime_seconds();
 }
 
+static enum app_runtime_state app_ble_runtime_state_get(void)
+{
+	return app.runtime_state;
+}
+
+static enum app_wake_reason app_ble_wake_reason_get(void)
+{
+	return app.last_wake_reason;
+}
+
+static uint16_t app_ble_error_code_get(void)
+{
+	return (uint16_t)app.current_error;
+}
+
+static uint32_t app_ble_state_transition_count_get(void)
+{
+	return app.state_transition_count;
+}
+
+static uint32_t app_ble_accel_window_count_get(void)
+{
+	return app.accel_window.completed_window_count;
+}
+
 static const struct app_ble_callbacks ble_callbacks = {
 	.mode_requested = app_ble_mode_requested,
 	.command_received = app_ble_command_received,
-	.click_count_get = app_ble_click_count_get,
+
 	.mode_get = app_ble_mode_get,
-	.button_pressed_get = app_ble_button_pressed_get,
-	.uptime_seconds_get = app_ble_uptime_seconds_get,
+
+	.runtime_state_get = app_ble_runtime_state_get,
+	.wake_reason_get = app_ble_wake_reason_get,
+	.error_code_get = app_ble_error_code_get,
+
+	.state_transition_count_get =
+		app_ble_state_transition_count_get,
+
+	.uptime_seconds_get =
+		app_ble_uptime_seconds_get,
+
+	.accel_window_count_get =
+		app_ble_accel_window_count_get,
 };
 
 static void app_post_nfc_data_read_event(void)
@@ -636,9 +676,10 @@ static int app_nfc_init(void)
 		return err;
 	}
 
-	err = app_nfc_start(app.mode,
-		    app.single_click_count,
-		    app_nfc_mode_command_received);
+	err = app_nfc_start(
+	app.mode,
+	app.current_error,
+	app_nfc_mode_command_received);
 
 	if (err < 0) {
 		LOG_ERR("Failed to start NFC payload: %d", err);
@@ -684,6 +725,16 @@ static void accel_sample_timer_handler(struct k_timer *timer)
 	ARG_UNUSED(timer);
 
 	app_post_accel_sample_event();
+}
+
+static void report_timer_handler(struct k_timer *timer)
+{
+	ARG_UNUSED(timer);
+
+	app_post_event(
+		APP_EVENT_REPORT_TIMEOUT,
+		APP_EVENT_VALUE_UNUSED
+	);
 }
 
 static void single_click_timer_handler(struct k_timer *timer)
@@ -855,6 +906,7 @@ static int app_init(void)
 	app.mode = APP_MODE_NORMAL;
 	app.runtime_state = APP_STATE_BOOT;
 	app.last_wake_reason = APP_WAKE_REASON_BOOT;
+	app.current_error = APP_ERROR_NONE;
 	app.state_transition_count = 0U;
 
 	ret = app_gpio_init();
@@ -930,6 +982,8 @@ static void app_log_startup_config(void)
 
 	LOG_INF("Last wake reason: %s",
 		app_wake_reason_name(app.last_wake_reason));
+	LOG_INF("NORMAL report window: %u ms",
+		NORMAL_REPORT_WINDOW_MS);
 }
 
 static void app_mode_next(void)
@@ -960,9 +1014,6 @@ static void app_handle_single_click(void)
 	case APP_MODE_NORMAL:
 		app.single_click_count++;
 		led0_toggle();
-
-		(void)app_ble_notify_click_count(app.single_click_count);
-		app_nfc_update_request(app.mode, app.single_click_count);
 
 		LOG_INF("Single click handled. Count: %u",
 			app.single_click_count);
@@ -1054,14 +1105,23 @@ static void app_accel_sampling_stop(void)
 	k_timer_stop(&accel_sample_timer);
 }
 
+static void app_report_window_cancel(void)
+{
+	k_timer_stop(&report_timer);
+}
+
 static void app_enter_idle(void)
 {
 	int ret;
 
+	app_report_window_cancel();
 	app_accel_sampling_stop();
 
-	/* Every future wake begins with a completely new window. */
-	app_accel_window_reset();
+	/*
+	 * Every future wake begins with a completely new window.
+	 */
+	app.accel_window.sample_index = 0U;
+	app.accel_ble_sample_counter = 0U;
 
 	/*
 	 * Ensure the interrupt route is disabled before changing
@@ -1200,16 +1260,106 @@ static void app_start_measurement(enum app_wake_reason reason)
 		app_wake_reason_name(app.last_wake_reason));
 }
 
+static int app_report_window_start(void)
+{
+	int ret;
+
+	if (app.mode != APP_MODE_NORMAL) {
+		LOG_ERR("Report window requested outside NORMAL mode");
+
+		return -EINVAL;
+	}
+
+	if (app.runtime_state != APP_STATE_REPORTING) {
+		LOG_ERR("Report window requested in runtime state: %s",
+			app_runtime_state_name(app.runtime_state));
+
+		return -EINVAL;
+	}
+
+	app_accel_sampling_stop();
+
+	ret = sensor_accel_motion_disarm();
+
+	if (ret < 0) {
+		LOG_ERR("Failed to power down accelerometer "
+			"for reporting: %d",
+			ret);
+
+			return ret;
+	}
+
+	ret = app_ble_set_advertising(true);
+
+	if (ret < 0) {
+		LOG_ERR("Failed to enable Bluetooth reporting "
+			"advertising: %d",
+			ret);
+	}
+
+	k_timer_stop(&report_timer);
+
+	k_timer_start(
+		&report_timer,
+		K_MSEC(NORMAL_REPORT_WINDOW_MS),
+		K_NO_WAIT);
+
+	LOG_INF("NORMAL-mode Bluetooth report window started:; %u ms",
+		NORMAL_REPORT_WINDOW_MS);
+
+	return 0;
+	
+}
+
+static void app_handle_report_timout(void)
+{
+	int ret;
+
+	if ((app.mode != APP_MODE_NORMAL) ||
+	(app.runtime_state != APP_STATE_REPORTING)) {
+
+		LOG_DBG("Ignoring stale report-timeout event");
+
+		return;
+	}
+
+	app_report_window_cancel();
+
+	ret = app_ble_set_advertising(false);
+
+	if (ret < 0) {
+		LOG_ERR("Failed to stop reporting advertising: %d",
+			ret);
+	}
+
+	ret = app_ble_disconnect();
+
+	if (ret < 0) {
+		LOG_ERR("Failed to report ending connection: %d",
+			ret);
+	}
+
+	LOG_INF("NORMAL-mode Bluetooth report window ended");
+
+	app_enter_idle();
+}
+
 static void app_finish_measurement(void)
 {
 	bool continuous_measurement =
 		(app.mode == APP_MODE_DIAGNOSTIC);
+
 	int ret;
 
 	if (!continuous_measurement) {
 		app_accel_sampling_stop();
 	}
 
+	/*
+	 * Store the result before enabling NORMAL-mode advertising.
+	 * A phone that connects immediately will therefore read the
+	 * completed packet rather than the previous result.
+	 */
 	app_set_runtime_state(APP_STATE_REPORTING);
 
 	ret = app_ble_update_vibration(
@@ -1218,17 +1368,55 @@ static void app_finish_measurement(void)
 		app.vibration.mean_z_mg,
 		app.vibration.rms_mg,
 		app.vibration.peak_mg,
-		(uint16_t)app.accel_window.completed_window_count);
+		(uint16_t)
+			app.accel_window.completed_window_count);
 
-	if ((ret < 0) && (ret != -ENOTCONN) && (ret != -EACCES)) {
-		LOG_WRN("Failed to update BLE vibration result: %d", ret);
+	/*
+	 * In NORMAL mode there will normally be no connection yet.
+	 * The function still stores the latest result before returning
+	 * -ENOTCONN or -EACCES.
+	 */
+	if ((ret < 0) &&
+	    (ret != -ENOTCONN) &&
+	    (ret != -EACCES)) {
+
+		LOG_WRN("Failed to update BLE vibration result: %d",
+			ret);
 	}
 
 	if (continuous_measurement) {
+		/*
+		 * DIAGNOSTIC mode keeps collecting windows. Bluetooth
+		 * is already available in this mode.
+		 */
 		app_set_runtime_state(APP_STATE_MEASURING);
 		return;
 	}
 
+	if (app.mode == APP_MODE_NORMAL) {
+		ret = app_report_window_start();
+
+		if (ret < 0) {
+			LOG_ERR("Failed to start NORMAL report window: %d",
+				ret);
+
+			/*
+			 * Make sure a partially started advertising operation
+			 * is not left requested.
+			 */
+			(void)app_ble_set_advertising(false);
+
+			app_set_runtime_state(APP_STATE_ERROR);
+		}
+
+		return;
+	}
+
+	/*
+	 * CONFIG mode does not normally perform vibration windows,
+	 * but return safely to its configured idle behavior if a
+	 * measurement finishes during a mode transition.
+	 */
 	app_enter_idle();
 }
 
@@ -1356,8 +1544,38 @@ static void app_accel_window_calculate(void)
 			peak_magnitude_squared);
 }
 
+static int app_apply_ble_policy(void)
+{
+	switch(app.mode) {
+	case APP_MODE_NORMAL:
+	return app_ble_set_advertising(false);
+
+	case APP_MODE_CONFIG:
+	case APP_MODE_DIAGNOSTIC:
+		return app_ble_set_advertising(true);
+
+	default:
+		return -EINVAL;
+	}
+}
+
 static void app_apply_mode_runtime(enum app_wake_reason reason)
 {
+	int ret;
+
+	app_report_window_cancel();
+
+	ret = app_apply_ble_policy();
+
+	if (ret < 0) {
+		LOG_ERR("Failed to apply Bluetooth policy for mode %s: %d",
+			app_mode_name(app.mode),
+			ret);
+
+		app_set_runtime_state(APP_STATE_ERROR);
+		return;
+	}
+
 	switch (app.mode) {
 	case APP_MODE_DIAGNOSTIC:
 		app_start_measurement(reason);
@@ -1369,7 +1587,9 @@ static void app_apply_mode_runtime(enum app_wake_reason reason)
 		break;
 
 	default:
-		LOG_ERR("Cannot apply unknown application mode: %d", app.mode);
+		LOG_ERR("Cannot apply unknown application mode: %d",
+			app.mode);
+
 		app_set_runtime_state(APP_STATE_ERROR);
 		break;
 	}
@@ -1462,7 +1682,6 @@ static void app_handle_mode_request(enum app_mode requested_mode)
 	}
 
 	(void)app_ble_notify_mode(app.mode);
-	app_nfc_update_request(app.mode, app.single_click_count);
 }
 
 static void app_handle_shake_detected(void)
@@ -1560,7 +1779,9 @@ static void app_event_handler(const struct app_event *event)
 		app.single_click_count = 0U;
 		app.heartbeat_count = 0U;
 
-		app_nfc_update_request(app.mode, app.single_click_count);
+		app_nfc_update_request(
+			app.mode,
+			app.current_error);
 
 		current_uptime_seconds = app_uptime_seconds();
 
@@ -1592,6 +1813,10 @@ static void app_event_handler(const struct app_event *event)
 
 	case APP_EVENT_SHAKE_DETECTED:
 		app_handle_shake_detected();
+		break;
+
+	case APP_EVENT_REPORT_TIMEOUT:
+		app_handle_report_timout();
 		break;
 
 	default:

@@ -36,7 +36,8 @@ static bool nfc_emulation_running;
 
 static atomic_t nfc_update_generation = ATOMIC_INIT(0);
 static atomic_t pending_mode = ATOMIC_INIT(APP_MODE_NORMAL);
-static atomic_t pending_click_count = ATOMIC_INIT(0);
+static atomic_t pending_error_code =
+	ATOMIC_INIT(APP_ERROR_NONE);
 static atomic_t nfc_field_present = ATOMIC_INIT(0);
 static atomic_t nfc_update_pending = ATOMIC_INIT(0);
 
@@ -120,18 +121,22 @@ bool app_nfc_field_off(void)
 	return true;
 }
 
-static int app_nfc_update_payload(enum app_mode mode,
-				  uint32_t single_click_count)
+static int app_nfc_update_payload(
+	enum app_mode mode,
+	enum app_error_code error_code)
 {
 	static const uint8_t language_code[] = NFC_LANGUAGE_CODE;
 	int text_length;
 	int err;
 
-	text_length = snprintk((char *)nfc_text_buffer,
-			       sizeof(nfc_text_buffer),
-			       "Zephyr Button App\nMode: %s\nClicks: %u",
-			       app_nfc_mode_name(mode),
-			       single_click_count);
+	text_length = snprintk(
+	nfc_text_buffer,
+	sizeof(nfc_text_buffer),
+	"EERMS Sensor\n"
+	"Mode: %s\n"
+	"Error: 0x%04x",
+	app_nfc_mode_name(mode),
+	(unsigned int)(uint16_t)error_code);
 	if (text_length < 0) {
 		LOG_ERR("Failed to format NFC text: %d", text_length);
 		return text_length;
@@ -215,8 +220,9 @@ static int app_nfc_update_payload(enum app_mode mode,
 
 	nfc_emulation_running = true;
 
-	LOG_INF("NFC payload updated with URI and status: mode=%s, clicks=%u",
-		app_nfc_mode_name(mode), single_click_count);
+	LOG_INF("NFC payload updated: mode=%s, error=0x%04x",
+	app_nfc_mode_name(mode),
+	(unsigned int)(uint16_t)error_code);
 	return 0;
 }
 
@@ -225,7 +231,6 @@ static void app_nfc_update_work_handler(struct k_work *work)
 	atomic_val_t generation_before;
 	atomic_val_t generation_after;
 	enum app_mode mode;
-	uint32_t single_click_count;
 	int err;
 	int ret;
 
@@ -233,9 +238,13 @@ static void app_nfc_update_work_handler(struct k_work *work)
 
 	generation_before = atomic_get(&nfc_update_generation);
 	mode = (enum app_mode)atomic_get(&pending_mode);
-	single_click_count = (uint32_t)atomic_get(&pending_click_count);
+	enum app_error_code error_code =
+	(enum app_error_code)atomic_get(
+		&pending_error_code);
 
-	err = app_nfc_update_payload(mode, single_click_count);
+	err = app_nfc_update_payload(
+	mode,
+	error_code);
 	if (err < 0) {
 		LOG_ERR("Failed to update NFC payload from work item: %d", err);
 		return;
@@ -255,13 +264,16 @@ static void app_nfc_update_work_handler(struct k_work *work)
 	}
 }
 
-void app_nfc_update_request(enum app_mode mode,
-			    uint32_t single_click_count)
+void app_nfc_update_request(
+	enum app_mode mode,
+	enum app_error_code error_code)
 {
 	int ret;
 
 	atomic_set(&pending_mode, (atomic_val_t)mode);
-	atomic_set(&pending_click_count, (atomic_val_t)single_click_count);
+	atomic_set(
+	&pending_error_code,
+	(atomic_val_t)error_code);
 	atomic_inc(&nfc_update_generation);
 
 	if (atomic_get(&nfc_field_present)) {
@@ -451,14 +463,19 @@ static int app_nfc_parse_mode_command(const uint8_t *text,
 	return -EINVAL;
 }
 
-int app_nfc_start(enum app_mode mode,
-		  uint32_t single_click_count,
-		  app_nfc_mode_command_cb_t mode_command_cb)
+int app_nfc_start(
+	enum app_mode mode,
+	enum app_error_code error_code,
+	app_nfc_mode_command_cb_t mode_command_cb)
 {
 	nfc_mode_command_cb = mode_command_cb;
 
 	atomic_set(&pending_mode, (atomic_val_t)mode);
-	atomic_set(&pending_click_count, (atomic_val_t)single_click_count);
+	atomic_set(
+	&pending_error_code,
+	(atomic_val_t)error_code);
 
-	return app_nfc_update_payload(mode, single_click_count);
+	return app_nfc_update_payload(
+	mode,
+	error_code);
 }

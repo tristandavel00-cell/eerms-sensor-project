@@ -9,25 +9,38 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/settings/settings.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/util.h>
+#include <zephyr/bluetooth/hci_types.h> 
 
 #include "app_ble.h"
 
 LOG_MODULE_REGISTER(app_ble, LOG_LEVEL_DBG);
 
-#define APP_STATUS_PACKET_SIZE        12U
-#define APP_STATUS_MODE_OFFSET         0U
-#define APP_STATUS_BUTTON_OFFSET       1U
-#define APP_STATUS_CLICK_COUNT_OFFSET  4U
-#define APP_STATUS_UPTIME_OFFSET       8U
-#define ACCEL_PACKET_SIZE              6U
-#define VIBRATION_PACKET_SIZE         12U
+#define APP_STATUS_PROTOCOL_VERSION 1U
+#define APP_STATUS_PACKET_SIZE      20U
+
+#define ACCEL_PACKET_SIZE     6U
+#define VIBRATION_PACKET_SIZE 12U
+
+#define APP_STATUS_VERSION_OFFSET          0U
+#define APP_STATUS_LENGTH_OFFSET           1U
+#define APP_STATUS_MODE_OFFSET             2U
+#define APP_STATUS_RUNTIME_STATE_OFFSET    3U
+#define APP_STATUS_WAKE_REASON_OFFSET      4U
+#define APP_STATUS_FLAGS_OFFSET            5U
+#define APP_STATUS_ERROR_CODE_OFFSET       6U
+#define APP_STATUS_TRANSITION_COUNT_OFFSET 8U
+#define APP_STATUS_UPTIME_OFFSET           12U
+#define APP_STATUS_WINDOW_COUNT_OFFSET     16U
+
+#define APP_STATUS_FLAG_CONNECTED             0x01U
+#define APP_STATUS_FLAG_ADVERTISING_REQUESTED 0x02U
+#define APP_STATUS_FLAG_ADVERTISING_ACTIVE    0x04U
 
 #define BT_UUID_BUTTON_SERVICE_VAL \
 	BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x56789abcdef0)
-#define BT_UUID_SINGLE_CLICK_COUNT_VAL \
-	BT_UUID_128_ENCODE(0x12345679, 0x1234, 0x5678, 0x1234, 0x56789abcdef0)
 #define BT_UUID_APP_MODE_VAL \
 	BT_UUID_128_ENCODE(0x1234567a, 0x1234, 0x5678, 0x1234, 0x56789abcdef0)
 #define BT_UUID_APP_STATUS_VAL \
@@ -42,7 +55,9 @@ LOG_MODULE_REGISTER(app_ble, LOG_LEVEL_DBG);
 static const struct app_ble_callbacks *app_callbacks;
 static struct bt_conn *current_conn;
 
-static bool single_click_notifications_enabled;
+static atomic_t advertising_requested = ATOMIC_INIT(0);
+static atomic_t advertising_active = ATOMIC_INIT(0); 
+
 static bool app_mode_notifications_enabled;
 static bool accel_notifications_enabled;
 static bool vibration_notifications_enabled;
@@ -60,8 +75,6 @@ static uint16_t latest_window_count;
 
 static struct bt_uuid_128 button_service_uuid =
 	BT_UUID_INIT_128(BT_UUID_BUTTON_SERVICE_VAL);
-static struct bt_uuid_128 single_click_count_uuid =
-	BT_UUID_INIT_128(BT_UUID_SINGLE_CLICK_COUNT_VAL);
 static struct bt_uuid_128 app_mode_uuid =
 	BT_UUID_INIT_128(BT_UUID_APP_MODE_VAL);
 static struct bt_uuid_128 app_status_uuid =
@@ -94,11 +107,6 @@ static const struct bt_le_conn_param preferred_conn_params = {
 	.timeout = 400,
 };
 
-static ssize_t read_single_click_count(struct bt_conn *conn,
-				       const struct bt_gatt_attr *attr,
-				       void *buf,
-				       uint16_t len,
-				       uint16_t offset);
 static ssize_t write_app_mode(struct bt_conn *conn,
 			      const struct bt_gatt_attr *attr,
 			      const void *buf,
@@ -132,14 +140,6 @@ static ssize_t read_vibration_data(struct bt_conn *conn,
 				   uint16_t len,
 				   uint16_t offset);
 
-static void single_click_ccc_changed(const struct bt_gatt_attr *attr,
-				     uint16_t value)
-{
-	ARG_UNUSED(attr);
-	single_click_notifications_enabled = (value == BT_GATT_CCC_NOTIFY);
-	LOG_INF("Single-click notifications %s",
-		single_click_notifications_enabled ? "enabled" : "disabled");
-}
 
 static void app_mode_ccc_changed(const struct bt_gatt_attr *attr,
 				 uint16_t value)
@@ -179,12 +179,6 @@ static void vibration_ccc_changed(const struct bt_gatt_attr *attr,
 BT_GATT_SERVICE_DEFINE(
 	button_service,
 	BT_GATT_PRIMARY_SERVICE(&button_service_uuid.uuid),
-	BT_GATT_CHARACTERISTIC(&single_click_count_uuid.uuid,
-			       BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
-			       BT_GATT_PERM_READ,
-			       read_single_click_count, NULL, NULL),
-	BT_GATT_CCC(single_click_ccc_changed,
-		    BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
 	BT_GATT_CHARACTERISTIC(&app_mode_uuid.uuid,
 			       BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE |
 				       BT_GATT_CHRC_NOTIFY,
@@ -247,31 +241,91 @@ static void vibration_packet_build(uint8_t *packet)
 
 static int advertising_start(void)
 {
-	int err = bt_le_adv_start(&advertising_params,
-				  advertising_data,
-				  ARRAY_SIZE(advertising_data),
-				  NULL, 0);
+	int err;
+
+	if (!atomic_get(&advertising_requested)) {
+		return 0;
+	}
+
+	if (current_conn != NULL) {
+		return 0;
+	}
+
+	if (!atomic_cas(&advertising_active, 0 ,1)) {
+		return 0;
+	}
+
+	err = bt_le_adv_start(&advertising_params,
+				advertising_data,
+				ARRAY_SIZE(advertising_data),
+				NULL,
+				0);
+
+	if (err == -EALREADY) {
+		LOG_DBG("Bluetooth advertising was already active");;
+		return 0;
+	}
+
 	if (err < 0) {
-		LOG_ERR("Bluetooth advertising failed to start: %d", err);
+		atomic_set(&advertising_active, 0);
+		LOG_ERR("Bluetooth advertising failed to start: %d",
+			err);
 		return err;
 	}
 
-	LOG_INF("Bluetooth advertising started as \"%s\"",
+	LOG_INF("Bluetooth advertising started a \"%s\"",
 		CONFIG_BT_DEVICE_NAME);
+
 	return 0;
+}
+
+static int advertising_stop(void)
+{
+	bool was_active =
+		atomic_get(&advertising_active) != 0;
+
+	int err;
+
+	if (current_conn != NULL) {
+		atomic_set(&advertising_active, 0);
+		return 0;
+	}
+
+	err = bt_le_adv_stop();
+
+	if (err < 0) {
+		LOG_ERR("Bluetooth advertising failed to stop: %d",
+			err);
+		return err;
+	}
+
+	atomic_set(&advertising_active, 0);
+
+	if(was_active) {
+		LOG_INF("Bluetooth advertising stopped");
+	}
+
+	return 0;
+	
 }
 
 static void advertising_restart_handler(struct k_work *work)
 {
+	int err;
+
 	ARG_UNUSED(work);
 
-	int err = advertising_start();
-	if (err < 0) {
-		LOG_ERR("Failed to restart Bluetooth advertising: %d", err);
+	if (!atomic_get(&advertising_requested)) {
+		LOG_DBG("Advertising restart skipped: not requested");
 		return;
 	}
 
-	LOG_INF("Bluetooth advertising restarted");
+	err = advertising_start();
+
+	if (err < 0) {
+		LOG_ERR("Failed to retart Bluetooth advertising: %d",
+			err);
+	}
 }
 
 K_WORK_DEFINE(advertising_restart_work, advertising_restart_handler);
@@ -279,9 +333,27 @@ K_WORK_DEFINE(advertising_restart_work, advertising_restart_handler);
 static void connected(struct bt_conn *conn, uint8_t err)
 {
 	if (err != 0U) {
+		int ret;
+
+		atomic_set(&advertising_active, 0);
+
 		LOG_ERR("Bluetooth connection failed: %u", err);
+
+		if (atomic_get(&advertising_requested)) {
+			ret = k_work_submit(
+				&advertising_restart_work
+			);
+			if (ret < 0) {
+				LOG_ERR("Failed to submit advertising"
+					"restart work: %d",
+					ret);
+			}
+		}
+
 		return;
 	}
+
+	atomic_set(&advertising_active, 0);
 
 	if (current_conn != NULL) {
 		bt_conn_unref(current_conn);
@@ -307,16 +379,26 @@ static void connected(struct bt_conn *conn, uint8_t err)
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
-	LOG_INF("Bluetooth device disconnected. Reason: %u", reason);
+	LOG_INF("Bluetooth device disconnected. Reason: %u",
+		reason);
 
 	if (current_conn == conn) {
 		bt_conn_unref(current_conn);
 		current_conn = NULL;
 	}
 
+	atomic_set(&advertising_active, 0);
+
+	if (!atomic_get(&advertising_requested)) {
+		LOG_INF("Bluetooth advertising remains disabled");
+		return;
+	}
+
 	int ret = k_work_submit(&advertising_restart_work);
+
 	if (ret < 0) {
-		LOG_ERR("Failed to submit advertising restart work: %d", ret);
+		LOG_ERR("Failed to submit advertising restart work: %d",
+			ret);
 	}
 }
 
@@ -379,19 +461,6 @@ BT_CONN_CB_DEFINE(connection_callbacks) = {
 	.security_changed = security_changed,
 };
 
-static ssize_t read_single_click_count(struct bt_conn *conn,
-				       const struct bt_gatt_attr *attr,
-				       void *buf,
-				       uint16_t len,
-				       uint16_t offset)
-{
-	uint8_t packet[sizeof(uint32_t)];
-
-	sys_put_le32(app_callbacks->click_count_get(), packet);
-
-	return bt_gatt_attr_read(conn, attr, buf, len, offset,
-				 packet, sizeof(packet));
-}
 
 static ssize_t write_app_mode(struct bt_conn *conn,
 			      const struct bt_gatt_attr *attr,
@@ -433,6 +502,25 @@ static ssize_t read_app_mode(struct bt_conn *conn,
 				 &value, sizeof(value));
 }
 
+static uint8_t app_status_flags_get(void)
+{
+	uint8_t flags = 0U;
+
+	if (current_conn != NULL) {
+		flags |= APP_STATUS_FLAG_CONNECTED;
+	}
+
+	if (atomic_get(&advertising_requested) != 0) {
+		flags |= APP_STATUS_FLAG_ADVERTISING_REQUESTED;
+	}
+
+	if (atomic_get(&advertising_active) != 0) {
+		flags|= APP_STATUS_FLAG_ADVERTISING_ACTIVE;
+	}
+
+	return flags;
+}
+
 static ssize_t read_app_status(struct bt_conn *conn,
 			       const struct bt_gatt_attr *attr,
 			       void *buf,
@@ -441,17 +529,48 @@ static ssize_t read_app_status(struct bt_conn *conn,
 {
 	uint8_t packet[APP_STATUS_PACKET_SIZE] = {0};
 
-	packet[APP_STATUS_MODE_OFFSET] = (uint8_t)app_callbacks->mode_get();
-	packet[APP_STATUS_BUTTON_OFFSET] =
-		app_callbacks->button_pressed_get() ? 1U : 0U;
+	packet[APP_STATUS_VERSION_OFFSET] =
+		APP_STATUS_PROTOCOL_VERSION;
 
-	sys_put_le32(app_callbacks->click_count_get(),
-		     &packet[APP_STATUS_CLICK_COUNT_OFFSET]);
-	sys_put_le32(app_callbacks->uptime_seconds_get(),
-		     &packet[APP_STATUS_UPTIME_OFFSET]);
+	packet[APP_STATUS_LENGTH_OFFSET] =
+		(uint8_t)sizeof(packet);
 
-	return bt_gatt_attr_read(conn, attr, buf, len, offset,
-				 packet, sizeof(packet));
+	packet[APP_STATUS_MODE_OFFSET] =
+		(uint8_t)app_callbacks->mode_get();
+
+	packet[APP_STATUS_RUNTIME_STATE_OFFSET] =
+		(uint8_t)app_callbacks->runtime_state_get();
+
+	packet[APP_STATUS_WAKE_REASON_OFFSET] =
+		(uint8_t)app_callbacks->wake_reason_get();
+
+	packet[APP_STATUS_FLAGS_OFFSET] =
+		app_status_flags_get();
+
+	sys_put_le16(
+		app_callbacks->error_code_get(),
+		&packet[APP_STATUS_ERROR_CODE_OFFSET]);
+
+	sys_put_le32(
+		app_callbacks->state_transition_count_get(),
+		&packet[APP_STATUS_TRANSITION_COUNT_OFFSET]);
+
+	sys_put_le32(
+		app_callbacks->uptime_seconds_get(),
+		&packet[APP_STATUS_UPTIME_OFFSET]);
+
+	sys_put_le32(
+		app_callbacks->accel_window_count_get(),
+		&packet[APP_STATUS_WINDOW_COUNT_OFFSET]);
+
+	return bt_gatt_attr_read(
+		conn,
+		attr,
+		buf,
+		len,
+		offset,
+		packet,
+		sizeof(packet));
 }
 
 static ssize_t read_accel_data(struct bt_conn *conn,
@@ -522,14 +641,18 @@ static ssize_t write_app_command(struct bt_conn *conn,
 int app_ble_start(const struct app_ble_callbacks *callbacks)
 {
 	if ((callbacks == NULL) ||
-	    (callbacks->mode_requested == NULL) ||
-	    (callbacks->command_received == NULL) ||
-	    (callbacks->click_count_get == NULL) ||
-	    (callbacks->mode_get == NULL) ||
-	    (callbacks->button_pressed_get == NULL) ||
-	    (callbacks->uptime_seconds_get == NULL)) {
-		return -EINVAL;
-	}
+    (callbacks->mode_requested == NULL) ||
+    (callbacks->command_received == NULL) ||
+    (callbacks->mode_get == NULL) ||
+    (callbacks->runtime_state_get == NULL) ||
+    (callbacks->wake_reason_get == NULL) ||
+    (callbacks->error_code_get == NULL) ||
+    (callbacks->state_transition_count_get == NULL) ||
+    (callbacks->uptime_seconds_get == NULL) ||
+    (callbacks->accel_window_count_get == NULL)) {
+
+	return -EINVAL;
+}
 
 	app_callbacks = callbacks;
 
@@ -554,39 +677,64 @@ int app_ble_start(const struct app_ble_callbacks *callbacks)
 	}
 	LOG_INF("Bluetooth authentication callbacks registered");
 
-	return advertising_start();
+	atomic_set(&advertising_requested, 0);
+	atomic_set(&advertising_active, 0);
+
+	LOG_INF("Bluetooth ready; awaiting application advertising policy");
+
+	return 0;
 }
 
-int app_ble_notify_click_count(uint32_t click_count)
+int app_ble_set_advertising(bool enabled)
 {
-	uint8_t packet[sizeof(uint32_t)];
-	int err;
-
-	if (current_conn == NULL) {
-		LOG_DBG("Click notification skipped: no active connection");
-		return -ENOTCONN;
-	}
-
-	if (!single_click_notifications_enabled) {
-		LOG_DBG("Click notification skipped: notifications disabled");
+	if (!bt_is_ready()) {
+		LOG_ERR("Cannot change advertising policy: "
+			"Bluetooth is not ready");
 		return -EACCES;
 	}
 
-	sys_put_le32(click_count, packet);
+	atomic_set(&advertising_requested,
+		enabled ? 1:0);
 
-	err = bt_gatt_notify_uuid(current_conn,
-				  &single_click_count_uuid.uuid,
-				  button_service.attrs,
-				  packet,
-				  sizeof(packet));
+	LOG_INF("Bluetooth advertising policy: %s",
+		enabled ? "enabled" : "disabled");
+
+	if(enabled) {
+		return advertising_start();
+	}
+
+	return advertising_stop();
+}
+
+int app_ble_disconnect(void)
+{
+	int err;
+
+	if (current_conn == NULL) {
+		return 0;
+	}
+
+	err = bt_conn_disconnect(
+		current_conn,
+		BT_HCI_ERR_REMOTE_USER_TERM_CONN
+	);
+
+	if (err == -ENOTCONN) {
+		return 0;
+	}
+
 	if (err < 0) {
-		LOG_ERR("Failed to send click notification: %d", err);
+		LOG_ERR("Failed to disconnect Bluetooth connection: %d",
+			err);
+
 		return err;
 	}
 
-	LOG_DBG("Click notification sent: %u", click_count);
+	LOG_INF("Bluetooth disconnect requested");
+
 	return 0;
 }
+
 
 int app_ble_notify_mode(enum app_mode mode)
 {
