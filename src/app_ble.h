@@ -7,7 +7,6 @@
 #include "app_types.h"
 
 enum app_ble_command {
-	APP_BLE_COMMAND_RESET_COUNTERS = 0x01,
 	APP_BLE_COMMAND_STATUS_REPORT = 0x02,
 };
 

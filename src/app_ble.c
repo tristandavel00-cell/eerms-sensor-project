@@ -8,7 +8,6 @@
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/settings/settings.h>
 #include <zephyr/sys/atomic.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/util.h>
@@ -626,7 +625,6 @@ static ssize_t write_app_command(struct bt_conn *conn,
 
 	uint8_t value = *((const uint8_t *)buf);
 	switch (value) {
-	case APP_BLE_COMMAND_RESET_COUNTERS:
 	case APP_BLE_COMMAND_STATUS_REPORT:
 		app_callbacks->command_received((enum app_ble_command)value);
 		LOG_INF("Application command received over Bluetooth: 0x%02x",
@@ -662,13 +660,6 @@ int app_ble_start(const struct app_ble_callbacks *callbacks)
 		return err;
 	}
 	LOG_INF("Bluetooth initialized");
-
-	err = settings_load();
-	if (err < 0) {
-		LOG_ERR("Failed to load settings: %d", err);
-		return err;
-	}
-	LOG_INF("Settings loaded");
 
 	err = bt_conn_auth_info_cb_register(&auth_info_callbacks);
 	if ((err < 0) && (err != -EALREADY)) {

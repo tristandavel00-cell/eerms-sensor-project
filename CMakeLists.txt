@@ -8,4 +8,6 @@ target_sources(app PRIVATE
 	src/app_ble.c
 	src/app_nfc.c
 	src/sensor_accel.c
+	src/measurement.c
+	src/app_settings.c
 )
