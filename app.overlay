@@ -1,3 +1,5 @@
+#include <zephyr/dt-bindings/adc/adc.h>
+#include <zephyr/dt-bindings/adc/nrf-saadc.h>
 #include <zephyr/dt-bindings/gpio/gpio.h>
 #include <zephyr/dt-bindings/i2c/i2c.h>
 #include <zephyr/dt-bindings/pinctrl/nrf-pinctrl.h>
@@ -6,6 +8,24 @@
 / {
 	aliases {
 		accel0 = &lis2dw12;
+	};
+
+	/*
+	 * Application-specific hardware.
+	 *
+	 * Battery ADC:
+	 *     SAADC channel 0 reads physical input AIN6 / P0.30.
+	 *
+	 * Battery divider enable:
+	 *     P0.08 drives the BSS138 gate.
+	 *     Active high completes the lower divider leg to ground.
+	 */
+	zephyr,user {
+		io-channels = <&adc 0>;
+		io-channel-names = "battery";
+
+		battery-enable-gpios =
+			<&gpio0 8 GPIO_ACTIVE_HIGH>;
 	};
 };
 
@@ -21,6 +41,7 @@
 		group1 {
 			psels = <NRF_PSEL(TWIM_SDA, 0, 4)>,
 				<NRF_PSEL(TWIM_SCL, 0, 3)>;
+
 			low-power-enable;
 		};
 	};
@@ -28,8 +49,9 @@
 
 /*
  * P0.00 drives the TPS22860 ON input.
- * The TPS output drives the LIS2DW12 CS pin, so this GPIO must
- * be high before the LIS2DW12 driver starts.
+ *
+ * The TPS22860 output drives the LIS2DW12 CS pin, so this
+ * GPIO must be high before the LIS2DW12 driver starts.
  */
 &gpio0 {
 	accel_cs_enable_hog: accel-cs-enable-hog {
@@ -57,20 +79,59 @@
 		odr = <0>;
 		power-mode = <0>;
 
-		/*
-		 * Wired on the PCB, but interrupt operation is not
-		 * enabled during this milestone.
-		 */
 		irq-gpios = <&gpio0 11 GPIO_ACTIVE_HIGH>;
 		int-pin = <1>;
 
-		wakeup-duration = <LIS2DW12_DT_WAKEUP_2_ODR>;
+		wakeup-duration =
+			<LIS2DW12_DT_WAKEUP_2_ODR>;
 	};
+};
+
+/*
+ * SAADC channel 0 is a software ADC channel.
+ *
+ * NRF_SAADC_AIN6 selects the physical P0.30 analog input.
+ * The two numbers do not need to be the same.
+ */
+&adc {
+	status = "okay";
+
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	channel@0 {
+		reg = <0>;
+
+		zephyr,gain = "ADC_GAIN_1_6";
+		zephyr,reference = "ADC_REF_INTERNAL";
+
+		zephyr,acquisition-time =
+			<ADC_ACQ_TIME(
+				ADC_ACQ_TIME_MICROSECONDS,
+				40)>;
+
+		zephyr,input-positive =
+			<NRF_SAADC_AIN6>;
+
+		zephyr,resolution = <12>;
+	};
+};
+
+/*
+ * The nRF52-DK board definition normally assigns P0.08 to
+ * UART0. The production sensor uses P0.08 for the battery
+ * divider enable signal, so UART0 must not claim this pin.
+ *
+ * Logging remains available through RTT.
+ */
+&uart0 {
+	status = "disabled";
 };
 
 &nfct {
 	status = "okay";
 };
+
 &gpiote {
-    status = "okay";
+	status = "okay";
 };

@@ -5,9 +5,11 @@ project(gpio_interrupt_clean)
 
 target_sources(app PRIVATE
 	src/main.c
+	src/app_controller.c
 	src/app_ble.c
 	src/app_nfc.c
 	src/sensor_accel.c
+	src/sensor_battery.c
 	src/measurement.c
 	src/app_settings.c
 )

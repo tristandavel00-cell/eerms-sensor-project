@@ -17,26 +17,53 @@
 
 LOG_MODULE_REGISTER(app_ble, LOG_LEVEL_DBG);
 
-#define APP_STATUS_PROTOCOL_VERSION 1U
+#define APP_STATUS_PROTOCOL_VERSION 2U
 #define APP_STATUS_PACKET_SIZE      20U
 
-#define ACCEL_PACKET_SIZE     6U
-#define VIBRATION_PACKET_SIZE 12U
+#define ACCEL_PACKET_SIZE 6U
 
+#define MEASUREMENT_PACKET_PROTOCOL_VERSION 1U
+#define MEASUREMENT_PACKET_SIZE             20U
+
+#define MEASUREMENT_PACKET_VERSION_OFFSET       0U
+#define MEASUREMENT_PACKET_VALID_FLAGS_OFFSET   1U
+#define MEASUREMENT_PACKET_BATTERY_STATE_OFFSET 2U
+#define MEASUREMENT_PACKET_HEALTH_OFFSET        3U
+#define MEASUREMENT_PACKET_BATTERY_MV_OFFSET    4U
+#define MEASUREMENT_PACKET_TEMPERATURE_OFFSET   6U
+#define MEASUREMENT_PACKET_MEAN_X_OFFSET        8U
+#define MEASUREMENT_PACKET_MEAN_Y_OFFSET        10U
+#define MEASUREMENT_PACKET_MEAN_Z_OFFSET        12U
+#define MEASUREMENT_PACKET_RMS_OFFSET           14U
+#define MEASUREMENT_PACKET_PEAK_OFFSET          16U
+#define MEASUREMENT_PACKET_SEQUENCE_OFFSET      18U
 #define APP_STATUS_VERSION_OFFSET          0U
-#define APP_STATUS_LENGTH_OFFSET           1U
-#define APP_STATUS_MODE_OFFSET             2U
-#define APP_STATUS_RUNTIME_STATE_OFFSET    3U
-#define APP_STATUS_WAKE_REASON_OFFSET      4U
+#define APP_STATUS_MODE_OFFSET             1U
+#define APP_STATUS_RUNTIME_STATE_OFFSET    2U
+#define APP_STATUS_WAKE_REASON_OFFSET      3U
+#define APP_STATUS_HEALTH_OFFSET           4U
 #define APP_STATUS_FLAGS_OFFSET            5U
 #define APP_STATUS_ERROR_CODE_OFFSET       6U
-#define APP_STATUS_TRANSITION_COUNT_OFFSET 8U
-#define APP_STATUS_UPTIME_OFFSET           12U
-#define APP_STATUS_WINDOW_COUNT_OFFSET     16U
+#define APP_STATUS_FAULT_FLAGS_OFFSET      8U
+#define APP_STATUS_FAULT_COUNT_OFFSET      10U
+#define APP_STATUS_TRANSITION_COUNT_OFFSET 12U
+#define APP_STATUS_UPTIME_OFFSET           16U
 
 #define APP_STATUS_FLAG_CONNECTED             0x01U
 #define APP_STATUS_FLAG_ADVERTISING_REQUESTED 0x02U
 #define APP_STATUS_FLAG_ADVERTISING_ACTIVE    0x04U
+
+BUILD_ASSERT(
+	APP_STATUS_UPTIME_OFFSET + sizeof(uint32_t) ==
+		APP_STATUS_PACKET_SIZE,
+	"Application status packet layout does not match packet size");
+
+BUILD_ASSERT(
+	MEASUREMENT_PACKET_SEQUENCE_OFFSET +
+		sizeof(uint16_t) ==
+	MEASUREMENT_PACKET_SIZE,
+	"Measurement packet layout does not match packet size"
+);
 
 #define BT_UUID_BUTTON_SERVICE_VAL \
 	BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x56789abcdef0)
@@ -64,13 +91,8 @@ static bool vibration_notifications_enabled;
 static int16_t latest_accel_x_mg;
 static int16_t latest_accel_y_mg;
 static int16_t latest_accel_z_mg;
-static int16_t latest_mean_x_mg;
-static int16_t latest_mean_y_mg;
-static int16_t latest_mean_z_mg;
 
-static uint16_t latest_rms_mg;
-static uint16_t latest_peak_mg;
-static uint16_t latest_window_count;
+static struct app_ble_measurement latest_measurement;
 
 static struct bt_uuid_128 button_service_uuid =
 	BT_UUID_INIT_128(BT_UUID_BUTTON_SERVICE_VAL);
@@ -217,25 +239,83 @@ static void accel_packet_build(uint8_t *packet)
 	sys_put_le16((uint16_t)latest_accel_z_mg, &packet[4]);
 }
 
-static void vibration_packet_build(uint8_t *packet)
+static void measurement_packet_build(uint8_t *packet)
 {
-	sys_put_le16((uint16_t)latest_mean_x_mg,
-		     &packet[0]);
+	bool vibration_valid;
+	bool battery_valid;
+	bool temperature_valid;
 
-	sys_put_le16((uint16_t)latest_mean_y_mg,
-		     &packet[2]);
+	vibration_valid =
+		(latest_measurement.valid_flags &
+		 APP_BLE_MEASUREMENT_VALID_VIBRATION) != 0U;
 
-	sys_put_le16((uint16_t)latest_mean_z_mg,
-		     &packet[4]);
+	battery_valid =
+		(latest_measurement.valid_flags &
+		 APP_BLE_MEASUREMENT_VALID_BATTERY) != 0U;
 
-	sys_put_le16(latest_rms_mg,
-		     &packet[6]);
+	temperature_valid =
+		(latest_measurement.valid_flags &
+		 APP_BLE_MEASUREMENT_VALID_TEMPERATURE) != 0U;
 
-	sys_put_le16(latest_peak_mg,
-		     &packet[8]);
+	packet[MEASUREMENT_PACKET_VERSION_OFFSET] =
+		MEASUREMENT_PACKET_PROTOCOL_VERSION;
 
-	sys_put_le16(latest_window_count,
-		     &packet[10]);
+	packet[MEASUREMENT_PACKET_VALID_FLAGS_OFFSET] =
+		latest_measurement.valid_flags;
+
+	packet[MEASUREMENT_PACKET_BATTERY_STATE_OFFSET] =
+		(uint8_t)latest_measurement.battery_state;
+
+	packet[MEASUREMENT_PACKET_HEALTH_OFFSET] =
+		(uint8_t)latest_measurement.health;
+
+	sys_put_le16(
+		battery_valid ?
+			latest_measurement.battery_mv :
+			0U,
+		&packet[MEASUREMENT_PACKET_BATTERY_MV_OFFSET]);
+
+	sys_put_le16(
+		temperature_valid ?
+			(uint16_t)latest_measurement.temperature_centi_c :
+			0U,
+		&packet[MEASUREMENT_PACKET_TEMPERATURE_OFFSET]);
+
+	sys_put_le16(
+		vibration_valid ?
+			(uint16_t)latest_measurement.mean_x_mg :
+			0U,
+		&packet[MEASUREMENT_PACKET_MEAN_X_OFFSET]);
+
+	sys_put_le16(
+		vibration_valid ?
+			(uint16_t)latest_measurement.mean_y_mg :
+			0U,
+		&packet[MEASUREMENT_PACKET_MEAN_Y_OFFSET]);
+
+	sys_put_le16(
+		vibration_valid ?
+			(uint16_t)latest_measurement.mean_z_mg :
+			0U,
+		&packet[MEASUREMENT_PACKET_MEAN_Z_OFFSET]);
+
+	sys_put_le16(
+		vibration_valid ?
+			latest_measurement.rms_mg :
+			0U,
+		&packet[MEASUREMENT_PACKET_RMS_OFFSET]);
+
+	sys_put_le16(
+		vibration_valid ?
+			latest_measurement.peak_mg :
+			0U,
+		&packet[MEASUREMENT_PACKET_PEAK_OFFSET]);
+
+	sys_put_le16(
+		vibration_valid ?
+			latest_measurement.sequence :
+			0U,
+		&packet[MEASUREMENT_PACKET_SEQUENCE_OFFSET]);
 }
 
 static int advertising_start(void)
@@ -282,7 +362,6 @@ static int advertising_stop(void)
 {
 	bool was_active =
 		atomic_get(&advertising_active) != 0;
-
 	int err;
 
 	if (current_conn != NULL) {
@@ -290,8 +369,18 @@ static int advertising_stop(void)
 		return 0;
 	}
 
-	err = bt_le_adv_stop();
+	/*
+	 * Stopping an advertisement that was never started should be
+	 * treated as a successful no-op.
+	 *
+	 * This is important during a healthy NORMAL-mode boot, where
+	 * Bluetooth is initialized but advertising is intentionally off.
+	 */
+	if (!was_active) {
+		return 0;
+	}
 
+	err = bt_le_adv_stop();
 	if (err < 0) {
 		LOG_ERR("Bluetooth advertising failed to stop: %d",
 			err);
@@ -300,13 +389,12 @@ static int advertising_stop(void)
 
 	atomic_set(&advertising_active, 0);
 
-	if(was_active) {
-		LOG_INF("Bluetooth advertising stopped");
-	}
+	LOG_INF("Bluetooth advertising stopped");
 
 	return 0;
-	
 }
+	
+
 
 static void advertising_restart_handler(struct k_work *work)
 {
@@ -531,9 +619,6 @@ static ssize_t read_app_status(struct bt_conn *conn,
 	packet[APP_STATUS_VERSION_OFFSET] =
 		APP_STATUS_PROTOCOL_VERSION;
 
-	packet[APP_STATUS_LENGTH_OFFSET] =
-		(uint8_t)sizeof(packet);
-
 	packet[APP_STATUS_MODE_OFFSET] =
 		(uint8_t)app_callbacks->mode_get();
 
@@ -543,12 +628,23 @@ static ssize_t read_app_status(struct bt_conn *conn,
 	packet[APP_STATUS_WAKE_REASON_OFFSET] =
 		(uint8_t)app_callbacks->wake_reason_get();
 
+	packet[APP_STATUS_HEALTH_OFFSET] =
+		(uint8_t)app_callbacks->health_get();
+
 	packet[APP_STATUS_FLAGS_OFFSET] =
 		app_status_flags_get();
 
 	sys_put_le16(
 		app_callbacks->error_code_get(),
 		&packet[APP_STATUS_ERROR_CODE_OFFSET]);
+
+	sys_put_le16(
+		app_callbacks->fault_flags_get(),
+		&packet[APP_STATUS_FAULT_FLAGS_OFFSET]);
+
+	sys_put_le16(
+		app_callbacks->fault_occurrence_count_get(),
+		&packet[APP_STATUS_FAULT_COUNT_OFFSET]);
 
 	sys_put_le32(
 		app_callbacks->state_transition_count_get(),
@@ -557,10 +653,6 @@ static ssize_t read_app_status(struct bt_conn *conn,
 	sys_put_le32(
 		app_callbacks->uptime_seconds_get(),
 		&packet[APP_STATUS_UPTIME_OFFSET]);
-
-	sys_put_le32(
-		app_callbacks->accel_window_count_get(),
-		&packet[APP_STATUS_WINDOW_COUNT_OFFSET]);
 
 	return bt_gatt_attr_read(
 		conn,
@@ -592,17 +684,22 @@ static ssize_t read_vibration_data(struct bt_conn *conn,
 				   uint16_t len,
 				   uint16_t offset)
 {
-	uint8_t packet[VIBRATION_PACKET_SIZE];
+	uint8_t packet[MEASUREMENT_PACKET_SIZE] = {0};
 
-	vibration_packet_build(packet);
+	/*
+	 * The existing vibration UUID is now the versioned main
+	 * measurement characteristic.
+	 */
+	measurement_packet_build(packet);
 
-	return bt_gatt_attr_read(conn,
-				 attr,
-				 buf,
-				 len,
-				 offset,
-				 packet,
-				 sizeof(packet));
+	return bt_gatt_attr_read(
+		conn,
+		attr,
+		buf,
+		len,
+		offset,
+		packet,
+		sizeof(packet));
 }
 
 static ssize_t write_app_command(struct bt_conn *conn,
@@ -639,18 +736,21 @@ static ssize_t write_app_command(struct bt_conn *conn,
 int app_ble_start(const struct app_ble_callbacks *callbacks)
 {
 	if ((callbacks == NULL) ||
-    (callbacks->mode_requested == NULL) ||
-    (callbacks->command_received == NULL) ||
-    (callbacks->mode_get == NULL) ||
-    (callbacks->runtime_state_get == NULL) ||
-    (callbacks->wake_reason_get == NULL) ||
-    (callbacks->error_code_get == NULL) ||
-    (callbacks->state_transition_count_get == NULL) ||
-    (callbacks->uptime_seconds_get == NULL) ||
-    (callbacks->accel_window_count_get == NULL)) {
+	    (callbacks->mode_requested == NULL) ||
+	    (callbacks->command_received == NULL) ||
+	    (callbacks->mode_get == NULL) ||
+	    (callbacks->runtime_state_get == NULL) ||
+	    (callbacks->wake_reason_get == NULL) ||
+	    (callbacks->health_get == NULL) ||
+	    (callbacks->error_code_get == NULL) ||
+	    (callbacks->fault_flags_get == NULL) ||
+	    (callbacks->fault_occurrence_count_get == NULL) ||
+	    (callbacks->state_transition_count_get == NULL) ||
+	    (callbacks->uptime_seconds_get == NULL)) {
 
-	return -EINVAL;
-}
+		return -EINVAL;
+	}
+
 
 	app_callbacks = callbacks;
 
@@ -805,36 +905,38 @@ int app_ble_update_accel(int16_t x_mg,
 	return 0;
 }
 
-int app_ble_update_vibration(int16_t mean_x_mg,
-			     int16_t mean_y_mg,
-			     int16_t mean_z_mg,
-			     uint16_t rms_mg,
-			     uint16_t peak_mg,
-			     uint16_t window_count)
+int app_ble_update_measurement(
+	const struct app_ble_measurement *measurement)
 {
-	uint8_t packet[VIBRATION_PACKET_SIZE];
+	uint8_t packet[MEASUREMENT_PACKET_SIZE] = {0};
+	int err;
 
-	latest_mean_x_mg = mean_x_mg;
-	latest_mean_y_mg = mean_y_mg;
-	latest_mean_z_mg = mean_z_mg;
+	if (measurement == NULL) {
+		return -EINVAL;
+	}
 
-	latest_rms_mg = rms_mg;
-	latest_peak_mg = peak_mg;
-	latest_window_count = window_count;
+	/*
+	 * Store the complete result before checking connection state.
+	 *
+	 * NORMAL mode normally completes the measurement before the
+	 * phone connects, so a later GATT read must still return the
+	 * newest packet.
+	 */
+	latest_measurement = *measurement;
 
 	if (current_conn == NULL) {
-		LOG_DBG("Vibration notification skipped: no connection");
+		LOG_DBG("Measurement notification skipped: no connection");
 		return -ENOTCONN;
 	}
 
 	if (!vibration_notifications_enabled) {
-		LOG_DBG("Vibration notification skipped: disabled");
+		LOG_DBG("Measurement notification skipped: disabled");
 		return -EACCES;
 	}
 
-	vibration_packet_build(packet);
+	measurement_packet_build(packet);
 
-	int err = bt_gatt_notify_uuid(
+	err = bt_gatt_notify_uuid(
 		current_conn,
 		&vibration_data_uuid.uuid,
 		button_service.attrs,
@@ -842,19 +944,20 @@ int app_ble_update_vibration(int16_t mean_x_mg,
 		sizeof(packet));
 
 	if (err < 0) {
-		LOG_ERR("Failed to send vibration notification: %d",
+		LOG_ERR("Failed to send measurement notification: %d",
 			err);
 		return err;
 	}
 
-	LOG_DBG("Vibration notification sent: "
-		"mean=(%d, %d, %d), RMS=%u, peak=%u, window=%u",
-		mean_x_mg,
-		mean_y_mg,
-		mean_z_mg,
-		rms_mg,
-		peak_mg,
-		window_count);
+	LOG_DBG("Measurement notification sent: flags=0x%02x, "
+		"battery=%u mV, battery_state=%u, RMS=%u mg, "
+		"peak=%u mg, sequence=%u",
+		measurement->valid_flags,
+		(unsigned int)measurement->battery_mv,
+		(unsigned int)measurement->battery_state,
+		(unsigned int)measurement->rms_mg,
+		(unsigned int)measurement->peak_mg,
+		(unsigned int)measurement->sequence);
 
 	return 0;
 }

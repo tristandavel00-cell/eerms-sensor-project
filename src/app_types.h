@@ -61,6 +61,20 @@ enum app_health_state {
 };
 
 /*
+ * Battery condition reported in the main BLE measurement packet.
+ *
+ * These numeric values are part of the BLE protocol.
+ * Do not change existing values after release.
+ */
+enum app_battery_state {
+	APP_BATTERY_STATE_UNKNOWN = 0,
+	APP_BATTERY_STATE_GOOD = 1,
+	APP_BATTERY_STATE_DEGRADED = 2,
+	APP_BATTERY_STATE_LOW = 3,
+	APP_BATTERY_STATE_EXTREMELY_LOW = 4,
+};
+
+/*
  * Stable product error codes.
  *
  * Error-code ranges:
