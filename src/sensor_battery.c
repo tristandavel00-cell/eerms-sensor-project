@@ -105,7 +105,7 @@ int sensor_battery_init(void)
 int sensor_battery_read_mv(uint16_t *battery_mv)
 {
 	int16_t raw_sample = 0;
-	int32_t adc_input_mv;
+	int32_t adc_input_mv = 0;
 	int64_t calculated_battery_mv = 0;
 	int disable_ret;
 	int ret;
